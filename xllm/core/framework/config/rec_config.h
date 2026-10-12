@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
+#include <string>
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
@@ -52,7 +53,13 @@ class RecConfig final {
          "each_conversion_threshold",
          "total_conversion_threshold",
          "request_queue_size",
-         "rec_worker_max_concurrency"}};
+         "rec_worker_max_concurrency",
+         "enable_onerec_prefill_acl_graph",
+         "enable_multistream_perf_mode",
+         "enable_onerec_async_perf",
+         "enable_onerec_multistream_core_split",
+         "onerec_multistream_core_ratio",
+         "constrained_decoding_filter_path"}};
     return kOptionCategory;
   }
 
@@ -81,6 +88,17 @@ class RecConfig final {
   PROPERTY(int32_t, request_queue_size) = 100000;
 
   PROPERTY(uint32_t, rec_worker_max_concurrency) = 1;
+  PROPERTY(bool, enable_onerec_prefill_acl_graph) = false;
+
+  PROPERTY(bool, enable_multistream_perf_mode) = false;
+
+  PROPERTY(bool, enable_onerec_async_perf) = false;
+
+  PROPERTY(bool, enable_onerec_multistream_core_split) = false;
+
+  PROPERTY(double, onerec_multistream_core_ratio) = 0.5;
+
+  PROPERTY(std::string, constrained_decoding_filter_path) = "";
 };
 
 }  // namespace xllm

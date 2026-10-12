@@ -19,6 +19,7 @@ limitations under the License.
 #include <folly/MPMCQueue.h>
 #include <folly/futures/Future.h>
 
+#include <atomic>
 #include <limits>
 #include <memory>
 #include <queue>
@@ -49,7 +50,7 @@ struct ScheduleResult {
 class FixedStepsScheduler final : public ContinuousScheduler {
  public:
   FixedStepsScheduler(Engine* engine, const Options& options);
-  ~FixedStepsScheduler() override = default;
+  ~FixedStepsScheduler() override { step_threadpool_.reset(); }
 
   // step the scheduler forward by one step
   // may get blocked if there are no requests to process
@@ -63,6 +64,18 @@ class FixedStepsScheduler final : public ContinuousScheduler {
     virtual std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
                                               BatchFactory* batch_factory) = 0;
     virtual bool requires_kv_cache() const = 0;
+    virtual size_t max_prefill_requests_per_step(
+        const FixedStepsScheduler&) const {
+      return std::numeric_limits<size_t>::max();
+    }
+    virtual bool respects_prefill_memory_threshold(
+        const FixedStepsScheduler&) const {
+      return true;
+    }
+    virtual bool should_defer_resource_exhausted(
+        const FixedStepsScheduler&) const {
+      return false;
+    }
     // Allocate KV cache for sequence, implemented by each pipeline
     virtual bool allocate_kv_cache(KVCacheManager* kv_cache_manager,
                                    Sequence* sequence) = 0;
@@ -90,6 +103,12 @@ class FixedStepsScheduler final : public ContinuousScheduler {
 
   class OneRecXAttentionSchedulerPipeline final : public SchedulerPipeline {
    public:
+    size_t max_prefill_requests_per_step(
+        const FixedStepsScheduler& scheduler) const override;
+    bool respects_prefill_memory_threshold(
+        const FixedStepsScheduler& scheduler) const override;
+    bool should_defer_resource_exhausted(
+        const FixedStepsScheduler& scheduler) const override;
     std::vector<Batch> create_batches(FixedStepsScheduler& scheduler,
                                       BatchFactory* batch_factory) override;
     bool requires_kv_cache() const override { return true; }
@@ -136,6 +155,7 @@ class FixedStepsScheduler final : public ContinuousScheduler {
 
   // Semaphore to control concurrent execution of step()
   std::counting_semaphore<10000> step_semaphore_;
+  std::atomic<int32_t> in_flight_steps_{0};
 };
 
 }  // namespace xllm

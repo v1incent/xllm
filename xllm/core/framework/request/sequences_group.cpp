@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "sequences_group.h"
+#include "core/framework/request/sequences_group.h"
 
 #include <algorithm>
 #include <limits>
@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/framework/config/rec_config.h"
+#include "core/framework/request/rec_item_utils.h"
 #include "core/util/rec_model_utils.h"
 #include "framework/batch/beam_search.h"
 #include "util/blocking_counter.h"
@@ -126,8 +127,7 @@ void SequencesGroup::generate_outputs(std::vector<SequenceOutput>& outputs,
   }
 
   // Check for multi-round beam search results
-  if (is_rec_multi_round_mode() && check_beam_search() &&
-      sequences_.size() == 1) {
+  if (is_rec_multi_round_mode() && sequences_.size() == 1) {
     auto* base = sequences_[0].get();
     if (base->has_beam_result()) {
       generate_multi_round_output(outputs, tokenizer, *base);
@@ -467,7 +467,7 @@ void SequencesGroup::generate_multi_round_output(
     rank.emplace_back(lp, b);
   }
   std::sort(rank.begin(), rank.end(), [](const auto& l, const auto& r) {
-    return l.first > r.first;
+    return l.first != r.first ? l.first > r.first : l.second < r.second;
   });
 
   const auto& flat2d = base.beam_seq_group_flat();
@@ -483,6 +483,16 @@ void SequencesGroup::generate_multi_round_output(
     out.text = tokenizer.decode(Slice<int32_t>{gen_ids.data(), gen_ids.size()},
                                 sequence_params_.skip_special_tokens);
     out.token_ids = std::move(gen_ids);
+    decode_rec_items(tokenizer, sequence_params_.skip_special_tokens, i, out);
+    const auto& token_logprobs = base.beam_token_logprobs();
+    if (!token_logprobs.empty()) {
+      CHECK_EQ(token_logprobs.size(), bw);
+      CHECK_EQ(token_logprobs[b].size(), rounds);
+      out.token_ids_logprobs.reserve(rounds);
+      for (float value : token_logprobs[b]) {
+        out.token_ids_logprobs.emplace_back(value);
+      }
+    }
     std::vector<LogProb> log_probs;
     log_probs.resize(1);
     log_probs[0].logprob = rank[i].first;

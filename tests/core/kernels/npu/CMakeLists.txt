@@ -74,3 +74,12 @@ if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
 endif()
 
 add_subdirectory(tilelang)
+
+# Exercise the production wrapper on an explicitly selected NPU. Bootstrap
+# through the same Python runtime used by the REC C API.
+cc_test(
+  NAME rec_beam_search_test
+  NO_NPU_INIT
+  SRCS rec_beam_search_test.cpp
+  DEPS :xllm_ops :platform_npu torch torch_npu nnopbase GTest::gtest_main glog::glog
+)

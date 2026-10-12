@@ -20,6 +20,7 @@ cc_library(
     net.h
     pretty_print.h
     rec_model_utils.h
+    rec_infer_timing.h
     scope_guard.h
     slice.h
     spin_lock.h
@@ -52,6 +53,7 @@ cc_library(
     suffix_tree.cpp
     threadpool.cpp
     timer.cpp
+    rec_infer_timing.cpp
     utils.cpp
     uuid.cpp
     verbose_trace_logger.cpp

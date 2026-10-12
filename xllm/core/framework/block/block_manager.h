@@ -74,6 +74,8 @@ class BlockManager {
     // executor thread, so leaves are wrapped in ConcurrentBlockManagerImpl when
     // this is set to make those mutations thread-safe against the scheduler.
     PROPERTY(bool, enable_host_offload) = false;
+    // REC completes requests and returns blocks from worker threads.
+    PROPERTY(bool, enable_concurrent_allocations) = false;
     // xtensor (VMM) KV leaf parameters. When enable_xtensor is set, the KV leaf
     // is an XTensorBlockManagerImpl instead of a flat BlockManagerImpl; these
     // carry the construction args the spec builder needs.

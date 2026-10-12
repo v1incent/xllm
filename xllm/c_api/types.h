@@ -28,7 +28,7 @@ extern "C" {
 #define XLLM_META_STRING_FIELD_MAX_LEN 128
 
 // Major version of the public C ABI. A mismatch requires recompilation.
-#define XLLM_C_ABI_VERSION_MAJOR 1
+#define XLLM_C_ABI_VERSION_MAJOR 2
 
 // Export Macro Definition
 #ifndef XLLM_CAPI_EXPORT
@@ -185,7 +185,58 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
   // 1-8
   // meaning ith thread will be attached to first 8 logical processors
   char cpu_affinity[XLLM_META_STRING_FIELD_MAX_LEN];
-} XLLM_InitLLMOptions;
+
+  // REC extensions introduced in C ABI version 2.
+  /** Whether to enable OneRec decoder prefill ACL graph on NPU */
+  bool enable_onerec_prefill_acl_graph;
+
+  /** Max tokens in graph **/
+  int32_t max_tokens_for_graph_mode;
+
+  /** Whether to enable constrained decoding for REC */
+  bool enable_constrained_decoding;
+
+  /** Whether to convert token ids to item ids in REC response */
+  bool enable_convert_tokens_to_item;
+
+  /** Whether to output token-aligned logprobs tensor in REC response */
+  bool enable_output_sku_logprobs;
+
+  /** Whether to enable extended item info parsing and output tensors */
+  bool enable_extended_item_info;
+
+  /** Maximum items emitted for each REC token triplet */
+  int32_t each_conversion_threshold;
+
+  /** Maximum total items emitted in one REC response */
+  int32_t total_conversion_threshold;
+
+  /** Whether to enable OneRec xattention multistream performance mode */
+  bool enable_multistream_perf_mode;
+
+  /** Whether to enable OneRec xattention async perf env overrides in one shot:
+   *  XLLM_ONEREC_XATTN_ASYNC_BEAM_SEARCH, XLLM_ONEREC_XATTN_ASYNC_CACHE_SELECT,
+   *  TASK_QUEUE_ENABLE, PER_STREAM_QUEUE. Default false. */
+  bool enable_onerec_async_perf;
+
+  /** Whether to split NPU cores between two OneRec worker streams */
+  bool enable_onerec_multistream_core_split;
+
+  /** Ratio of NPU cores available to each OneRec worker stream */
+  double onerec_multistream_core_ratio;
+
+  /**
+   * Relative filename of the constrained decoding filter file (e.g.
+   * `beam_search_filter.bin`), resolved against the model weights directory
+   * with the same semantics as `vocab_file` in tokenizer_config.json. When
+   * non-empty, this value takes priority over `vocab_file` in
+   * tokenizer_config.json. Empty string = fall back to tokenizer_config.json.
+   */
+  char constrained_decoding_filter_path[XLLM_META_STRING_FIELD_MAX_LEN];
+
+} XLLM_InitOptions;
+
+typedef XLLM_InitOptions XLLM_InitLLMOptions;
 
 /**
  * @brief Chat message structure (for ChatCompletions)
@@ -263,6 +314,73 @@ typedef struct XLLM_CAPI_EXPORT XLLM_RequestParams {
   /** Request id */
   char request_id[XLLM_META_STRING_FIELD_MAX_LEN];
 } XLLM_RequestParams;
+
+/**
+ * @brief One input tensor for xllm_rec_input_tensors_completions.
+ * @note data_type uses numeric values from xllm.proto.DataType.
+ */
+typedef struct XLLM_CAPI_EXPORT XLLM_InferInputTensorDesc {
+  /** Tensor name, e.g. sparse_embedding or decoder_context_embedding. */
+  const char* name;
+
+  /** xllm.proto.DataType numeric value. */
+  int32_t data_type;
+
+  /** Row-major shape dimensions. */
+  const int64_t* shape;
+
+  /** Rank of shape. */
+  size_t shape_len;
+
+  /** Raw row-major tensor buffer. */
+  const void* data;
+
+  /** Number of elements in data. */
+  size_t num_elements;
+} XLLM_InferInputTensorDesc;
+
+/**
+ * @brief Raw output tensor returned to the embedded caller.
+ *
+ * This is the proto-free counterpart of xllm::proto::InferOutputTensor so
+ * embedded callers (e.g. 9n-predictor) can consume model outputs without
+ * paying for CompletionResponse serialize/parse and RepeatedField copies.
+ *
+ * Memory is owned by the enclosing XLLM_Response and is freed by
+ * xllm_*_free_response().
+ */
+typedef struct XLLM_CAPI_EXPORT XLLM_InferOutputTensor {
+  /** Tensor name, e.g. "rec_result". Owned by XLLM_Response. */
+  const char* name;
+
+  /** Numeric DataType, identical to xllm::proto::DataType. */
+  int32_t data_type;
+
+  /** Row-major shape dimensions. Owned by XLLM_Response. */
+  const int64_t* shape;
+
+  /** Rank of shape. */
+  size_t shape_len;
+
+  /** Raw row-major tensor buffer. Owned by XLLM_Response. */
+  const void* data;
+
+  /**
+   * Number of elements (product of shape). For numeric dtypes this equals the
+   * element count. For STRING tensors (proto DataType::STRING) this is the
+   * number of strings; data is a packed buffer of [uint32_t len][bytes] chunks.
+   */
+  size_t num_elements;
+} XLLM_InferOutputTensor;
+
+/**
+ * @brief List of raw output tensors (proto-free path).
+ * @note When entries_size == 0, callers should not access entries.
+ */
+typedef struct XLLM_CAPI_EXPORT XLLM_InferOutputTensors {
+  XLLM_InferOutputTensor* entries;
+  size_t entries_size;
+} XLLM_InferOutputTensors;
 
 /**
  * @brief API response status codes
@@ -382,6 +500,19 @@ typedef struct XLLM_CAPI_EXPORT XLLM_RecOutput {
 
   /** Number of entries in rec_token_logprobs */
   size_t rec_token_logprobs_size;
+
+  /**
+   * Extended item DID strings, parallel to item_ids (length == item_ids_size).
+   * Populated when enable_extended_item_info is true.
+   */
+  char** item_dids;
+
+  /**
+   * Extended item type strings, parallel to item_ids (length == item_ids_size).
+   * Populated when enable_extended_item_info is true.
+   */
+  char** item_types;
+
 } XLLM_RecOutput;
 
 /**
@@ -396,6 +527,38 @@ typedef struct XLLM_CAPI_EXPORT XLLM_RecOutputs {
 } XLLM_RecOutputs;
 
 #define XLLM_ERROR_INFO_MAX_LEN 512
+
+/**
+ * @brief Per-request inference timing breakdown (microseconds).
+ *
+ * Populated by the embedded REC C API path (keyed by request_id across
+ * worker threads) and retrieved via xllm_rec_take_last_infer_timing().
+ */
+typedef struct XLLM_CAPI_EXPORT XLLM_InferTimingDetail {
+  /** Request id aligned with XLLM_Response::id. */
+  char request_id[XLLM_META_STRING_FIELD_MAX_LEN];
+
+  /** convert_c_infer_input_tensors_to_onerec_mm_data in rec.cpp. */
+  int64_t convert_input_tensors_us;
+
+  /** RecMaster request-handling threadpool queue wait. */
+  int64_t threadpool_wait_us;
+
+  /** verify_params + generate_request before scheduler enqueue. */
+  int64_t build_request_us;
+
+  /**
+   * Request created -> process_completed start; matches request.cpp
+   * total_latency.
+   */
+  int64_t scheduler_infer_us;
+
+  /** generate_output in AsyncResponseProcessor. */
+  int64_t generate_output_us;
+
+  /** build_success_response + populate_raw_output_tensors in C API callback. */
+  int64_t build_response_us;
+} XLLM_InferTimingDetail;
 
 /**
  * @brief Inference response structure
@@ -427,6 +590,29 @@ typedef struct XLLM_CAPI_EXPORT XLLM_Response {
 
   /** REC/OneRec specific response extensions */
   XLLM_RecOutputs rec_outputs;
+
+  /**
+   * Raw output tensors aligned with xllm::proto::CompletionResponse
+   * output_tensors. Populated for REC_COMPLETIONS / LLM_COMPLETIONS so that
+   * embedded callers can consume tensor data with a single memcpy instead
+   * of paying for CompletionResponse serialize / parse + RepeatedField copy.
+   *
+   * When entries_size == 0 the proto fallback (completion_response_proto)
+   * may still be populated; embedded callers should prefer this field when
+   * non-empty.
+   */
+  XLLM_InferOutputTensors output_tensors;
+
+  /**
+   * Serialized xllm::proto::CompletionResponse payload (legacy fallback).
+   * Deprecated: prefer output_tensors above. Left for backward compatibility
+   * with old embedded callers; default builds populate output_tensors and
+   * leave this field NULL / size 0.
+   */
+  char* completion_response_proto;
+
+  /** Byte size of completion_response_proto. */
+  size_t completion_response_proto_size;
 } XLLM_Response;
 
 /**

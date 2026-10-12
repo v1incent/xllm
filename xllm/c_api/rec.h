@@ -286,6 +286,25 @@ XLLM_CAPI_EXPORT XLLM_Response* xllm_rec_multimodal_completions(
     const XLLM_RequestParams* request_params);
 
 /**
+ * @brief Generate recommendation completions from raw input_tensors.
+ * @param handler Valid, initialized REC inference instance handle.
+ * @param model_id Null-terminated string of the loaded REC model ID.
+ * @param tensors Array of XLLM_InferInputTensorDesc.
+ * @param tensor_count Number of tensors in @p tensors.
+ * @param timeout_ms Timeout in milliseconds (0 = no timeout).
+ * @param request_params Generation parameters (NULL = use REC defaults).
+ * @return Pointer to XLLM_Response. Caller must free with
+ * xllm_rec_free_response().
+ */
+XLLM_CAPI_EXPORT XLLM_Response* xllm_rec_input_tensors_completions(
+    XLLM_REC_Handler* handler,
+    const char* model_id,
+    const XLLM_InferInputTensorDesc* tensors,
+    size_t tensor_count,
+    uint32_t timeout_ms,
+    const XLLM_RequestParams* request_params);
+
+/**
  * @brief Generate generative recommendation chat completions from multi-turn
  * conversation history Generates personalized recommendation responses for a
  * multi-turn user-assistant conversation
@@ -329,7 +348,38 @@ XLLM_CAPI_EXPORT XLLM_Response* xllm_rec_chat_completions(
  */
 XLLM_CAPI_EXPORT void xllm_rec_free_response(XLLM_Response* resp);
 
+/**
+ * @brief Initialize REC on explicit devices, e.g. "npu:0" or "cuda:0".
+ * @note The three-argument xllm_rec_initialize keeps automatic device
+ * selection.
+ */
+XLLM_CAPI_EXPORT bool xllm_rec_initialize_with_devices(
+    XLLM_REC_Handler* handler,
+    const char* model_path,
+    const char* devices,
+    const XLLM_InitOptions* init_options);
+
+/**
+ * @brief Take the timing breakdown for a completed synchronous REC request.
+ * @param request_id Request id aligned with XLLM_Response::id (must not be
+ * NULL/empty).
+ * @param out Output buffer (must not be NULL).
+ * @return true when @p out is populated; false when no timing is available.
+ */
+XLLM_CAPI_EXPORT bool xllm_rec_take_last_infer_timing(
+    const char* request_id,
+    XLLM_InferTimingDetail* out);
+
 #ifdef __cplusplus
+}
+
+// Source compatibility for embedded callers of the 0.9 C++ header.
+inline bool xllm_rec_initialize(XLLM_REC_Handler* handler,
+                                const char* model_path,
+                                const char* devices,
+                                const XLLM_InitOptions* init_options) {
+  return xllm_rec_initialize_with_devices(
+      handler, model_path, devices, init_options);
 }
 #endif
 

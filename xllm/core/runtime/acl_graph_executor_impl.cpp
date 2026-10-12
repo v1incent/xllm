@@ -969,6 +969,11 @@ AclGraphExecutorImpl::AclGraphExecutorImpl(CausalLM* model,
                                            const torch::Device& device,
                                            const runtime::Options& options)
     : model_(model), args_(args), device_(device), options_(options) {
+  if (model_->supports_onerec_graph()) {
+    onerec_graph_executor_ = std::make_unique<OneRecAclGraphExecutor>(
+        model_, args_, device_, options_);
+    return;
+  }
   const bool need_update_attn_mask = model->is_hybrid_linear_attention();
   const bool is_hybrid_linear_attn = model->is_hybrid_linear_attention();
   graph_slot_count_ =
@@ -1000,6 +1005,14 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
                                       const torch::Tensor& positions,
                                       std::vector<KVCache>& kv_caches,
                                       const ModelInputParams& params) {
+  if (onerec_graph_executor_) {
+    if (onerec_graph_executor_->is_graph_candidate(params)) {
+      return onerec_graph_executor_->run(tokens, positions, kv_caches, params);
+    }
+    onerec_graph_executor_->reset_first_prefill_graph_state_if_needed(params);
+    COUNTER_INC(num_model_execution_total_eager);
+    return forward_eager(model_, tokens, positions, kv_caches, params);
+  }
   // no mirco batch in decode phase
   const torch::Tensor& tokens_tensor = tokens;
   const torch::Tensor& positions_tensor = positions;
@@ -1327,6 +1340,10 @@ void AclGraphExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,
                                                const torch::Tensor& positions,
                                                std::vector<KVCache>& kv_caches,
                                                const ModelInputParams& params) {
+  if (onerec_graph_executor_) {
+    // OneRec owns its persistent buffers and prepares them inside run().
+    return;
+  }
   const bool in_decoding_phase = params.meta.batch_forward_type.is_decode();
   const bool in_spec_verify_phase =
       params.is_spec_verify &&

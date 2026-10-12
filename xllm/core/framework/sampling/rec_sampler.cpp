@@ -189,6 +189,26 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
     const SamplingParameters& params,
     const torch::Tensor& filter_mask,
     const RecSamplingContext* context) const {
+  if (is_onerec_single_step_mode()) {
+    SamplingParameters probability_params = params;
+    // The generic greedy shortcut returns only P(selected token). Computing
+    // logprobs also materializes the complete post-filter distribution.
+    probability_params.logprobs = true;
+    probability_params.max_top_logprobs = 0;
+    auto probability_logits = logits.to(torch::kFloat32);
+    auto probability_mask =
+        filter_mask.defined() ? filter_mask : params.filter_mask;
+    if (probability_mask.defined()) {
+      CHECK_EQ(probability_mask.dim(), 2);
+      CHECK_GE(probability_mask.size(1), probability_logits.size(1));
+      // A split first head covers the prefix starting at token zero.
+      probability_mask =
+          probability_mask.slice(1, 0, probability_logits.size(1));
+    }
+    return sampler_.forward(
+        probability_logits, probability_params, probability_mask);
+  }
+
   if (context != nullptr && context->device_constrained_sampler &&
       !params.filter_mask.defined()) {
     auto sampled = context->device_constrained_sampler(logits,

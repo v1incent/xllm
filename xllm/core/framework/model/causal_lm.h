@@ -91,6 +91,26 @@ class CausalLM : public torch::nn::Module {
   // hidden_states: [num_tokens, hidden_size]
   // seleted_idxes: [num_tokens]
   // returns: [num_seqs, hidden_size]
+  virtual bool supports_onerec_graph() const { return false; }
+
+  virtual torch::Tensor get_onerec_graph_encoder_output() const {
+    return torch::Tensor();
+  }
+
+  virtual void bind_onerec_prefill_graph_buffers(
+      const torch::Tensor& encoder_output,
+      const std::vector<torch::Tensor>& cross_k_caches,
+      const std::vector<torch::Tensor>& cross_v_caches) {
+    (void)encoder_output;
+    (void)cross_k_caches;
+    (void)cross_v_caches;
+  }
+  virtual torch::Tensor logits(const torch::Tensor& hidden_states,
+                               const torch::Tensor& selected_idxes,
+                               int32_t /*step*/) {
+    return logits(hidden_states, selected_idxes);
+  }
+
   virtual torch::Tensor pooler(const torch::Tensor& hidden_states,
                                const torch::Tensor& seleted_idxes) {
     if (seleted_idxes.defined()) {

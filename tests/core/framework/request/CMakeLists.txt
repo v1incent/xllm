@@ -153,3 +153,10 @@ target_link_libraries(sequence_stop_output_test
 target_link_options(sequence_stop_output_test
                     PRIVATE
                     $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME rec_item_utils_test
+  NO_NPU_INIT
+  SRCS rec_item_utils_test.cpp
+  DEPS GTest::gtest_main
+)

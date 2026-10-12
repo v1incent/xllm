@@ -46,67 +46,83 @@ if(USE_NPU)
   # CANN 8.5+ migration: ascend_direct_transport replaces ascend_transport
   set(USE_ASCEND_DIRECT ON CACHE BOOL "Enable ADXL engine for Ascend NPU" FORCE)
 
-  execute_process(
-    COMMAND git -c "safe.directory=${CMAKE_SOURCE_DIR}/third_party/xllm_ops" -C "${CMAKE_SOURCE_DIR}/third_party/xllm_ops" rev-parse HEAD
-    OUTPUT_VARIABLE XLLM_OPS_GIT_HEAD
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-  )
-
-  if(DEFINED ENV{ASCEND_OPP_PATH} AND NOT "$ENV{ASCEND_OPP_PATH}" STREQUAL "")
-    set(XLLM_OPS_MARKER_PATH "$ENV{ASCEND_OPP_PATH}/vendors/xllm/.xllm_ops_git_head")
+  set(XLLM_PREBUILT_OPS_DIR "" CACHE PATH
+      "Prebuilt xllm operator vendor directory (contains op_api); skip global installation")
+  if(XLLM_PREBUILT_OPS_DIR)
+    get_filename_component(XLLM_PREBUILT_OPS_DIR "${XLLM_PREBUILT_OPS_DIR}" ABSOLUTE)
+    if(NOT EXISTS "${XLLM_PREBUILT_OPS_DIR}/op_api/lib/libcust_opapi.so")
+      message(FATAL_ERROR "XLLM_PREBUILT_OPS_DIR must contain op_api/lib/libcust_opapi.so")
+    endif()
+    foreach(OP_HEADER aclnn_beam_search_group.h aclnn_cross_attention.h aclnn_rec_constrained_top_k.h)
+      if(NOT EXISTS "${XLLM_PREBUILT_OPS_DIR}/op_api/include/${OP_HEADER}" AND
+         NOT EXISTS "${XLLM_PREBUILT_OPS_DIR}/op_api/include/aclnnop/${OP_HEADER}")
+        message(FATAL_ERROR "Prebuilt xllm operators are missing ${OP_HEADER}")
+      endif()
+    endforeach()
+    message(STATUS "Using prebuilt xllm operators: ${XLLM_PREBUILT_OPS_DIR}")
   else()
-    message(FATAL_ERROR "ASCEND_OPP_PATH is not initialized for NPU build.")
-  endif()
-
-  if(DEFINED ENV{XLLM_OPS_GIT_HEAD_CACHED})
-    set(XLLM_OPS_GIT_HEAD_CACHED "$ENV{XLLM_OPS_GIT_HEAD_CACHED}")
-  endif()
-
-  if(DEFINED ENV{XLLM_OPS_BUILD_DIR})
-    get_filename_component(XLLM_OPS_BUILD_DIR "$ENV{XLLM_OPS_BUILD_DIR}" ABSOLUTE)
-  else()
-    set(XLLM_OPS_BUILD_DIR "${CMAKE_SOURCE_DIR}/third_party/xllm_ops/build")
-  endif()
-
-  if(NOT DEFINED XLLM_OPS_GIT_HEAD_CACHED OR NOT XLLM_OPS_GIT_HEAD STREQUAL XLLM_OPS_GIT_HEAD_CACHED)
-    message(STATUS "xllm_ops git HEAD changed; running precompile via execute_process")
     execute_process(
-      COMMAND ${CMAKE_COMMAND} -E env "XLLM_OPS_BUILD_DIR=${XLLM_OPS_BUILD_DIR}"
-              bash ${CMAKE_SOURCE_DIR}/third_party/xllm_ops/build.sh
-      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/xllm_ops
-      RESULT_VARIABLE XLLM_OPS_RESULT
+      COMMAND git -c "safe.directory=${CMAKE_SOURCE_DIR}/third_party/xllm_ops" -C "${CMAKE_SOURCE_DIR}/third_party/xllm_ops" rev-parse HEAD
+      OUTPUT_VARIABLE XLLM_OPS_GIT_HEAD
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
     )
-    if(NOT XLLM_OPS_RESULT EQUAL 0)
-      message(FATAL_ERROR
-        "Failed to precompile xllm ops, error code: ${XLLM_OPS_RESULT}.\n"
-        "This precompile ran because the xllm_ops git HEAD changed "
-        "(e.g. after switching commits/branches or updating the submodule).\n"
-        "A common cause of failure here is a stale incremental build cache: "
-        "removed or renamed operators leave dangling CMake targets and opc "
-        "reports 'xxx.json not generated'.\n"
-        "Fix by removing the stale xllm_ops build directory and re-running the "
-        "build. CMake re-triggers the xllm_ops precompile automatically (the "
-        "HEAD cache is only updated after a successful precompile), and the "
-        "main C++ incremental build is unaffected:\n"
-        "  rm -rf ${XLLM_OPS_BUILD_DIR}")
+
+    if(DEFINED ENV{ASCEND_OPP_PATH} AND NOT "$ENV{ASCEND_OPP_PATH}" STREQUAL "")
+      set(XLLM_OPS_MARKER_PATH "$ENV{ASCEND_OPP_PATH}/vendors/xllm/.xllm_ops_git_head")
+    else()
+      message(FATAL_ERROR "ASCEND_OPP_PATH is not initialized for NPU build.")
     endif()
 
-    ## Adapt to the modification in DeekSeekV4 where the installation path of xllm_ops has been changed to custom_xllm_math
-    ## Probe under ASCEND_OPP_PATH (the same root the marker is written to, and the
-    ## one scripts/build_support/utils.py reads) so the read and write paths cannot diverge.
-    if(EXISTS "$ENV{ASCEND_OPP_PATH}/vendors/custom_xllm_math/op_api/include/aclnnop")
-      set(XLLM_OPS_MARKER_PATH "$ENV{ASCEND_OPP_PATH}/vendors/custom_xllm_math/.xllm_ops_git_head")
+    if(DEFINED ENV{XLLM_OPS_GIT_HEAD_CACHED})
+      set(XLLM_OPS_GIT_HEAD_CACHED "$ENV{XLLM_OPS_GIT_HEAD_CACHED}")
     endif()
-    message(STATUS "XLLM_OPS_MARKER_PATH: ${XLLM_OPS_MARKER_PATH}")
 
-    set(XLLM_OPS_GIT_HEAD_CACHED "${XLLM_OPS_GIT_HEAD}" CACHE INTERNAL "" FORCE)
-    get_filename_component(XLLM_OPS_MARKER_DIR "${XLLM_OPS_MARKER_PATH}" DIRECTORY)
-    file(MAKE_DIRECTORY "${XLLM_OPS_MARKER_DIR}")
-    file(WRITE "${XLLM_OPS_MARKER_PATH}" "${XLLM_OPS_GIT_HEAD}\n")
-    message(STATUS "xllm ops precompiled and HEAD cache updated")
-  else()
-    message(STATUS "xllm_ops git HEAD unchanged; skipping precompile")
+    if(DEFINED ENV{XLLM_OPS_BUILD_DIR})
+      get_filename_component(XLLM_OPS_BUILD_DIR "$ENV{XLLM_OPS_BUILD_DIR}" ABSOLUTE)
+    else()
+      set(XLLM_OPS_BUILD_DIR "${CMAKE_SOURCE_DIR}/third_party/xllm_ops/build")
+    endif()
+
+    if(NOT DEFINED XLLM_OPS_GIT_HEAD_CACHED OR NOT XLLM_OPS_GIT_HEAD STREQUAL XLLM_OPS_GIT_HEAD_CACHED)
+      message(STATUS "xllm_ops git HEAD changed; running precompile via execute_process")
+      execute_process(
+        COMMAND ${CMAKE_COMMAND} -E env "XLLM_OPS_BUILD_DIR=${XLLM_OPS_BUILD_DIR}"
+                bash ${CMAKE_SOURCE_DIR}/third_party/xllm_ops/build.sh
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/xllm_ops
+        RESULT_VARIABLE XLLM_OPS_RESULT
+      )
+      if(NOT XLLM_OPS_RESULT EQUAL 0)
+        message(FATAL_ERROR
+          "Failed to precompile xllm ops, error code: ${XLLM_OPS_RESULT}.\n"
+          "This precompile ran because the xllm_ops git HEAD changed "
+          "(e.g. after switching commits/branches or updating the submodule).\n"
+          "A common cause of failure here is a stale incremental build cache: "
+          "removed or renamed operators leave dangling CMake targets and opc "
+          "reports 'xxx.json not generated'.\n"
+          "Fix by removing the stale xllm_ops build directory and re-running the "
+          "build. CMake re-triggers the xllm_ops precompile automatically (the "
+          "HEAD cache is only updated after a successful precompile), and the "
+          "main C++ incremental build is unaffected:\n"
+          "  rm -rf ${XLLM_OPS_BUILD_DIR}")
+      endif()
+
+      ## Adapt to the modification in DeekSeekV4 where the installation path of xllm_ops has been changed to custom_xllm_math
+      ## Probe under ASCEND_OPP_PATH (the same root the marker is written to, and the
+      ## one scripts/build_support/utils.py reads) so the read and write paths cannot diverge.
+      if(EXISTS "$ENV{ASCEND_OPP_PATH}/vendors/custom_xllm_math/op_api/include/aclnnop")
+        set(XLLM_OPS_MARKER_PATH "$ENV{ASCEND_OPP_PATH}/vendors/custom_xllm_math/.xllm_ops_git_head")
+      endif()
+      message(STATUS "XLLM_OPS_MARKER_PATH: ${XLLM_OPS_MARKER_PATH}")
+
+      set(XLLM_OPS_GIT_HEAD_CACHED "${XLLM_OPS_GIT_HEAD}" CACHE INTERNAL "" FORCE)
+      get_filename_component(XLLM_OPS_MARKER_DIR "${XLLM_OPS_MARKER_PATH}" DIRECTORY)
+      file(MAKE_DIRECTORY "${XLLM_OPS_MARKER_DIR}")
+      file(WRITE "${XLLM_OPS_MARKER_PATH}" "${XLLM_OPS_GIT_HEAD}\n")
+      message(STATUS "xllm ops precompiled and HEAD cache updated")
+    else()
+      message(STATUS "xllm_ops git HEAD unchanged; skipping precompile")
+    endif()
   endif()
 endif()
 
@@ -181,8 +197,8 @@ endfunction()
 # Set default build type
 if(NOT CMAKE_BUILD_TYPE)
   message(STATUS "Build type not set - defaulting to Release")
-  set(CMAKE_BUILD_TYPE "Release" 
-      CACHE STRING "Choose the type of build from: Debug Release RelWithDebInfo MinSizeRel Coverage." 
+  set(CMAKE_BUILD_TYPE "Release"
+      CACHE STRING "Choose the type of build from: Debug Release RelWithDebInfo MinSizeRel Coverage."
       FORCE
   )
 endif()
@@ -331,7 +347,7 @@ if(DEVICE_ARCH STREQUAL "ARM")
        add_compile_options(-march=armv8.2-a+dotprod+crypto)
        message(STATUS "ARM: using -march=armv8.2-a+dotprod+crypto for optimal ISA")
    else()
-        add_compile_options(-march=native) 
+        add_compile_options(-march=native)
         message(STATUS "ARM: using -march=native (cross-compile fallback)")
    endif()
 endif()
@@ -485,6 +501,17 @@ if(USE_NPU)
   )
   message(STATUS "Configured xllm_atb_layers from source: ${XLLM_ATB_LAYERS_SOURCE_DIR}")
 
+  if(XLLM_PREBUILT_OPS_DIR)
+    set(XLLM_PREBUILT_OPS_INCLUDES "${XLLM_PREBUILT_OPS_DIR}/op_api/include")
+    if(EXISTS "${XLLM_PREBUILT_OPS_DIR}/op_api/include/aclnnop")
+      list(PREPEND XLLM_PREBUILT_OPS_INCLUDES
+          "${XLLM_PREBUILT_OPS_DIR}/op_api/include/aclnnop")
+    endif()
+    include_directories(BEFORE SYSTEM ${XLLM_PREBUILT_OPS_INCLUDES})
+    target_include_directories(xllm_atb_layers BEFORE PRIVATE ${XLLM_PREBUILT_OPS_INCLUDES})
+    list(PREPEND CMAKE_BUILD_RPATH "${XLLM_PREBUILT_OPS_DIR}/op_api/lib")
+  endif()
+
   if(EXISTS "$ENV{NPU_HOME_PATH}/include/aclnnop")
     target_include_directories(xllm_atb_layers SYSTEM PRIVATE
       $ENV{NPU_HOME_PATH}/include/aclnnop
@@ -543,7 +570,11 @@ if(USE_NPU)
     )
   endif()
 
-  link_libraries(cust_opapi)
+  if(XLLM_PREBUILT_OPS_DIR)
+    link_libraries("${XLLM_PREBUILT_OPS_DIR}/op_api/lib/libcust_opapi.so")
+  else()
+    link_libraries(cust_opapi)
+  endif()
   # avoid conflicts with xllm libruntime.a
   find_library(
     NPU_RUNTIME_SO
@@ -644,7 +675,7 @@ if(USE_MUSA)
     message(FATAL_ERROR
             "tvm_ffi is not installed under Python platlib: ${_PYTHON_PLATLIB}")
   endif()
-  
+
 
   include_directories(
       ${MUSA_INCLUDE_DIRS}

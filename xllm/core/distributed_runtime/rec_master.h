@@ -60,6 +60,13 @@ class RecMaster : public Master {
                       RequestParams sp,
                       OutputCallback callback);
 
+  // Direct, request-owned OneRec embeddings from the embedded C API.
+  void handle_request(MMData mm_data,
+                      RequestParams sp,
+                      OutputCallback callback);
+
+  RecPipelineType pipeline_type() const;
+
   // start the handling loop
   void run() override;
 
@@ -93,7 +100,17 @@ class RecMaster : public Master {
         const RequestParams& sp,
         OutputCallback callback);
 
+    virtual std::shared_ptr<Request> generate_request(MMData mm_data,
+                                                      const RequestParams& sp,
+                                                      OutputCallback callback);
+
    protected:
+    std::shared_ptr<Request> generate_onerec_mm_data_request_common(
+        MMData mm_data,
+        const RequestParams& sp,
+        OutputCallback callback,
+        bool build_stop_checker);
+
     std::shared_ptr<Request> generate_onerec_request_common(
         std::string prompt,
         std::optional<std::vector<int>> prompt_tokens,
@@ -138,6 +155,9 @@ class RecMaster : public Master {
         std::optional<std::vector<proto::InferInputTensor>> input_tensors,
         const RequestParams& sp,
         OutputCallback callback) override;
+    std::shared_ptr<Request> generate_request(MMData mm_data,
+                                              const RequestParams& sp,
+                                              OutputCallback callback) override;
   };
 
   // OneRecXAttentionMasterPipeline - OneRec xattention with stop checker for
@@ -153,6 +173,9 @@ class RecMaster : public Master {
         std::optional<std::vector<proto::InferInputTensor>> input_tensors,
         const RequestParams& sp,
         OutputCallback callback) override;
+    std::shared_ptr<Request> generate_request(MMData mm_data,
+                                              const RequestParams& sp,
+                                              OutputCallback callback) override;
   };
 
   // Factory method to create pipeline (can access private classes)
@@ -173,6 +196,7 @@ class RecMaster : public Master {
       bool build_stop_checker);
 
   // Pipeline instances
+  RecPipelineType pipeline_type_ = RecPipelineType::kLlmRecDefault;
   std::unique_ptr<RecMasterPipeline> pipeline_;
   std::unique_ptr<RecMasterPipeline> mm_data_pipeline_;
 

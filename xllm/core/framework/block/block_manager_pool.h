@@ -48,6 +48,8 @@ class BlockManagerPool : public KVCacheManager {
     // leaves in ConcurrentBlockManagerImpl so the async D2H offload callback
     // can free blocks off-thread safely.
     PROPERTY(bool, enable_host_offload) = false;
+    // REC completes requests and returns blocks from worker threads.
+    PROPERTY(bool, enable_concurrent_allocations) = false;
     PROPERTY(bool, enable_xtensor) = false;
     PROPERTY(int64_t, num_layers) = 0;  // Required when enable_xtensor is true
     PROPERTY(int64_t, slot_size) = 0;   // Memory size per slot (for xtensor)

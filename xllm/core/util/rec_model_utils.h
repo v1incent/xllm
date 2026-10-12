@@ -67,6 +67,11 @@ inline bool use_legacy_onerec_prefill_only_contract() {
          !is_onerec_xattention_mode();
 }
 
+inline bool is_onerec_single_step_mode() {
+  return is_onerec_xattention_mode() &&
+         RecConfig::get_instance().max_decode_rounds() == 1;
+}
+
 inline bool is_onerec_pipeline_type(RecPipelineType type) {
   return type == RecPipelineType::kOneRecDefault ||
          type == RecPipelineType::kOneRecXAttentionPipeline;

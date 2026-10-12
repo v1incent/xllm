@@ -31,6 +31,7 @@ limitations under the License.
 #include "aclnn_beam_search_group.h"
 #include "core/common/macros.h"
 #include "core/kernels/npu/utils.h"
+#include "core/kernels/rec_beam_search.h"
 #include "xllm_ops_api.h"
 
 namespace xllm::kernel::npu {
@@ -167,6 +168,28 @@ void beam_search_rec(const torch::Tensor& logprobs,
                << top_tokens.sizes();
   }
   const int64_t top_k = top_tokens.size(1);
+
+  CHECK_EQ(sequence_group.dim(), 3);
+  const int64_t beam_width = sequence_group.size(1);
+  // BeamSearchGroup assumes K == BW, groups of eight beams and a single
+  // eight-token history block. Its top_k attribute is the output width.
+  // Outside that domain, use device tensor operations with the same parent
+  // grouping and prefix-sum contract consumed by cache_select.
+  if (current_step > 0 &&
+      (beam_width % 8 != 0 || top_k != beam_width || beam_width > 512 ||
+       current_step >= 8 || sequence_group.size(0) > 48)) {
+    xllm::kernel::detail::select_rec_beams(logprobs,
+                                           top_tokens,
+                                           top_logprobs,
+                                           sequence_group,
+                                           current_step,
+                                           out_token_ids,
+                                           out_token_index,
+                                           out_log_probs,
+                                           out_beam_count_prefix_sums,
+                                           out_sequence);
+    return;
+  }
 
   aclTensor* logprobs_ids = nullptr;
   aclTensor* top_tokens_ids = nullptr;

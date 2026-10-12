@@ -24,3 +24,19 @@ cc_test(
 )
 target_link_libraries(util_test PRIVATE brpc leveldb::leveldb OpenSSL::SSL OpenSSL::Crypto)
 add_dependencies(util_test brpc-static)
+
+cc_test(
+  NAME rec_infer_timing_test
+  NO_NPU_INIT
+  SRCS
+    rec_infer_timing_test.cpp
+    ${PROJECT_SOURCE_DIR}/xllm/core/util/rec_infer_timing.cpp
+  DEPS GTest::gtest_main
+)
+
+cc_test(
+  NAME mpmc_threadpool_test
+  NO_NPU_INIT
+  SRCS mpmc_threadpool_test.cpp
+  DEPS util GTest::gtest_main
+)

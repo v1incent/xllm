@@ -37,6 +37,18 @@ class NpuWordEmbedding;
 }  // namespace layer
 
 namespace detail {
+// Detects a decode-step-aware logits(hidden, selected, int32_t step) overload
+// (OneRec split lm_head). Distinct from has_logits_with_hidden by the int arg.
+template <typename T, typename = void>
+struct has_logits_with_step : std::false_type {};
+
+template <typename T>
+struct has_logits_with_step<T,
+                            std::void_t<decltype(std::declval<T>()->logits(
+                                std::declval<const torch::Tensor&>(),
+                                std::declval<const torch::Tensor&>(),
+                                std::declval<int32_t>()))>> : std::true_type {};
+
 template <typename T, typename = void>
 struct has_get_lm_head : std::false_type {};
 
@@ -310,5 +322,34 @@ struct has_has_dspark_confidence_head<
     std::void_t<decltype(std::declval<T>()->has_dspark_confidence_head())>>
     : std::true_type {};
 
+template <typename T, typename = void>
+struct has_onerec_graph_support : std::false_type {};
+
+template <typename T>
+struct has_onerec_graph_support<
+    T,
+    std::void_t<decltype(std::declval<T>()->supports_onerec_graph())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_get_onerec_graph_encoder_output : std::false_type {};
+
+template <typename T>
+struct has_get_onerec_graph_encoder_output<
+    T,
+    std::void_t<decltype(std::declval<T>()->get_onerec_graph_encoder_output())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_bind_onerec_prefill_graph_buffers : std::false_type {};
+
+template <typename T>
+struct has_bind_onerec_prefill_graph_buffers<
+    T,
+    std::void_t<decltype(std::declval<T>()->bind_onerec_prefill_graph_buffers(
+        std::declval<const torch::Tensor&>(),
+        std::declval<const std::vector<torch::Tensor>&>(),
+        std::declval<const std::vector<torch::Tensor>&>()))>> : std::true_type {
+};
 }  // namespace detail
 }  // namespace xllm

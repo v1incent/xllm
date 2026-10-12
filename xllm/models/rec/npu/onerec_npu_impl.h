@@ -1,4 +1,4 @@
-/* Copyright 2025-2026 The xLLM Authors.
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,11 @@ limitations under the License.
 
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
 
+#include <array>
+#include <mutex>
+
 #include "core/common/global_flags.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/npu/npu_onerec_block_layer_impl.h"
 #include "core/util/env_var.h"
@@ -33,7 +37,16 @@ inline torch::Tensor pad_encoder_output(const torch::Tensor& encoder_output,
   const int64_t bs = onerec_params->bs;
   const int64_t hidden_size = encoder_output.size(1);
   const auto& seq_lens = onerec_params->encoder_seq_lens;
-  const int64_t max_seq_len = onerec_params->encoder_max_seq_len;
+  int64_t max_seq_len = onerec_params->encoder_max_seq_len;
+  if (input_params.onerec_xattention_params() != nullptr &&
+      onerec_params->cross_attn_block_tables.defined() &&
+      onerec_params->cross_attn_block_tables.dim() >= 2) {
+    CHECK_GT(KVCacheConfig::get_instance().block_size(), 0);
+    max_seq_len =
+        std::max<int64_t>(max_seq_len,
+                          onerec_params->cross_attn_block_tables.size(1) *
+                              KVCacheConfig::get_instance().block_size());
+  }
 
   CHECK_EQ(static_cast<int64_t>(seq_lens.size()), bs)
       << "encoder_seq_lens size mismatch.";
@@ -244,12 +257,19 @@ class OneRecStackImpl : public torch::nn::Module {
 
     const bool is_prefill =
         onerec_params->rec_stage == OneRecModelInputParams::RecStage::PREFILL;
-    auto [query_length, key_length] = compute_sequence_lengths(
-        input_params.meta.q_max_seq_len, is_prefill, input_params);
-
     ModelInputParams input_params_local = input_params;
     auto& mutable_onerec_params = input_params_local.mutable_onerec_params();
     const auto* onerec_xattn_params = input_params.onerec_xattention_params();
+    const bool is_xattn_decode =
+        is_decoder_ && !is_prefill && onerec_xattn_params != nullptr;
+    int64_t query_length = 0;
+    int64_t key_length = 0;
+    if (!is_xattn_decode) {
+      const auto sequence_lengths = compute_sequence_lengths(
+          input_params.meta.q_max_seq_len, is_prefill, input_params);
+      query_length = sequence_lengths.first;
+      key_length = sequence_lengths.second;
+    }
 
     auto validate_selected_token_idxes_stage = [&](const char* stage_name) {
       if (!is_decoder_ || onerec_xattn_params == nullptr ||
@@ -276,19 +296,27 @@ class OneRecStackImpl : public torch::nn::Module {
     };
 
     const bool is_decode_stage = is_decoder_ && !is_prefill;
-    torch::Tensor effective_attn_mask;
-    if (use_absolute_position_embedding_) {
-      const int64_t batch_size =
-          std::max<int64_t>(1, input_params.meta.num_sequences);
-      effective_attn_mask =
-          create_moe_attention_mask(query_length, h, is_decoder_, batch_size);
-    } else {
-      effective_attn_mask = compute_position_bias_mask(
-          query_length, key_length, h, is_decode_stage, input_params);
+    torch::Tensor preprocessed_attn_mask;
+    // XAttention decode uses PA caches and device-side sequence metadata, so
+    // the block layer can use its fixed placeholder instead of a length-sized
+    // position-bias/mask tensor.
+    if (!is_xattn_decode && !is_decoder_) {
+      preprocessed_attn_mask = get_or_create_encoder_attention_mask(
+          query_length, key_length, h, input_params);
+    } else if (!is_xattn_decode) {
+      torch::Tensor effective_attn_mask;
+      if (use_absolute_position_embedding_) {
+        const int64_t batch_size =
+            std::max<int64_t>(1, input_params.meta.num_sequences);
+        effective_attn_mask =
+            create_moe_attention_mask(query_length, h, is_decoder_, batch_size);
+      } else {
+        effective_attn_mask = compute_position_bias_mask(
+            query_length, key_length, h, is_decode_stage, input_params);
+      }
+      preprocessed_attn_mask =
+          preprocess_attention_mask(effective_attn_mask, h);
     }
-
-    auto preprocessed_attn_mask =
-        preprocess_attention_mask(effective_attn_mask, h);
 
     if (mutable_onerec_params.encoder_seq_lens_tensor.defined()) {
       auto flattened_tensor =
@@ -307,9 +335,9 @@ class OneRecStackImpl : public torch::nn::Module {
     }
 
     for (size_t i = 0; i < layers_.size(); ++i) {
-      aclrtEvent* event = nullptr;
-      std::atomic<bool>* event_flag = nullptr;
-      if (input_params.parallel.layer_synchronizer) {
+      aclrtEvent* event{nullptr};
+      std::atomic<bool>* event_flag{nullptr};
+      if (input_params.parallel.layer_synchronizer != nullptr) {
         event = input_params.parallel.layer_synchronizer->get_event(i);
         event_flag =
             input_params.parallel.layer_synchronizer->get_event_flag(i);
@@ -351,6 +379,21 @@ class OneRecStackImpl : public torch::nn::Module {
     return h;
   }
 
+  void bind_onerec_prefill_graph_cross_kv_caches(
+      const std::vector<torch::Tensor>& cross_k_caches,
+      const std::vector<torch::Tensor>& cross_v_caches) {
+    if (cross_k_caches.empty() && cross_v_caches.empty()) {
+      return;
+    }
+    CHECK(is_decoder_) << "Only OneRec decoder owns cross attention caches.";
+    CHECK_EQ(cross_k_caches.size(), layers_.size());
+    CHECK_EQ(cross_v_caches.size(), layers_.size());
+    for (size_t i = 0; i < layers_.size(); ++i) {
+      layers_[i]->set_cross_kv_cache_for_graph(cross_k_caches[i],
+                                               cross_v_caches[i]);
+    }
+  }
+
   void load_state_dict(const StateDict& state_dict) {
     auto embed_dict = state_dict.get_dict_with_prefix("embed_tokens.");
     if (embed_dict.size() > 0) {
@@ -372,6 +415,7 @@ class OneRecStackImpl : public torch::nn::Module {
 
     norm_->load_state_dict(
         state_dict.get_dict_with_prefix("final_layer_norm."));
+    clear_attention_mask_cache();
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
@@ -394,6 +438,8 @@ class OneRecStackImpl : public torch::nn::Module {
   }
 
  private:
+  static constexpr size_t kEncoderAttentionMaskCacheCapacity = 4;
+
   std::pair<int64_t, int64_t> compute_sequence_lengths(
       int64_t seq_length,
       bool is_prefill,
@@ -500,6 +546,108 @@ class OneRecStackImpl : public torch::nn::Module {
     return effective_attn_mask;
   }
 
+  class EncoderAttentionMaskCacheKey final {
+   public:
+    bool valid = false;
+    bool use_absolute_position_embedding = false;
+    int64_t query_length = 0;
+    int64_t key_length = 0;
+    int64_t num_heads = 0;
+    torch::Dtype dtype = torch::kFloat32;
+    torch::Device device = torch::Device(torch::kCPU);
+    int64_t relative_attention_num_buckets = 0;
+    int64_t relative_attention_max_distance = 0;
+
+    bool operator==(const EncoderAttentionMaskCacheKey& other) const {
+      return valid && other.valid &&
+             use_absolute_position_embedding ==
+                 other.use_absolute_position_embedding &&
+             query_length == other.query_length &&
+             key_length == other.key_length && num_heads == other.num_heads &&
+             dtype == other.dtype && device == other.device &&
+             relative_attention_num_buckets ==
+                 other.relative_attention_num_buckets &&
+             relative_attention_max_distance ==
+                 other.relative_attention_max_distance;
+    }
+  };
+
+  struct EncoderAttentionMaskCacheEntry {
+    EncoderAttentionMaskCacheKey key;
+    torch::Tensor mask;
+    uint64_t last_used = 0;
+  };
+
+  torch::Tensor get_or_create_encoder_attention_mask(
+      int64_t query_length,
+      int64_t key_length,
+      const torch::Tensor& h,
+      const ModelInputParams& input_params) {
+    CHECK(!is_decoder_) << "Encoder attention mask cache is encoder-only.";
+
+    EncoderAttentionMaskCacheKey cache_key;
+    cache_key.valid = true;
+    cache_key.use_absolute_position_embedding =
+        use_absolute_position_embedding_;
+    cache_key.query_length = query_length;
+    cache_key.key_length = key_length;
+    cache_key.num_heads = num_heads_;
+    cache_key.dtype = h.scalar_type();
+    cache_key.device = h.device();
+    cache_key.relative_attention_num_buckets = relative_attention_num_buckets_;
+    cache_key.relative_attention_max_distance =
+        relative_attention_max_distance_;
+
+    {
+      std::lock_guard<std::mutex> lock(attention_mask_cache_mutex_);
+      for (auto& entry : attention_mask_cache_) {
+        if (entry.key == cache_key && entry.mask.defined()) {
+          entry.last_used = ++attention_mask_cache_clock_;
+          return entry.mask;
+        }
+      }
+    }
+
+    torch::Tensor effective_attn_mask;
+    if (use_absolute_position_embedding_) {
+      effective_attn_mask = create_moe_attention_mask(
+          query_length, h, /*is_decoder=*/false, /*batch_size=*/1);
+    } else {
+      effective_attn_mask =
+          compute_position_bias_mask(query_length,
+                                     key_length,
+                                     h,
+                                     /*is_decode_stage=*/false,
+                                     input_params);
+    }
+    auto preprocessed_attn_mask =
+        preprocess_attention_mask(effective_attn_mask, h);
+
+    std::lock_guard<std::mutex> lock(attention_mask_cache_mutex_);
+    auto* target_entry = &attention_mask_cache_[0];
+    for (auto& entry : attention_mask_cache_) {
+      if (!entry.mask.defined()) {
+        target_entry = &entry;
+        break;
+      }
+      if (entry.last_used < target_entry->last_used) {
+        target_entry = &entry;
+      }
+    }
+    target_entry->key = cache_key;
+    target_entry->mask = preprocessed_attn_mask;
+    target_entry->last_used = ++attention_mask_cache_clock_;
+    return target_entry->mask;
+  }
+
+  void clear_attention_mask_cache() {
+    std::lock_guard<std::mutex> lock(attention_mask_cache_mutex_);
+    for (auto& entry : attention_mask_cache_) {
+      entry = EncoderAttentionMaskCacheEntry();
+    }
+    attention_mask_cache_clock_ = 0;
+  }
+
   torch::Tensor preprocess_attention_mask(
       const torch::Tensor& effective_attn_mask,
       const torch::Tensor& h) const {
@@ -537,6 +685,10 @@ class OneRecStackImpl : public torch::nn::Module {
 
   torch::nn::ModuleList blocks_{nullptr};
   std::vector<layer::NpuOneRecBlockLayer> layers_;
+  std::mutex attention_mask_cache_mutex_;
+  uint64_t attention_mask_cache_clock_ = 0;
+  std::array<EncoderAttentionMaskCacheEntry, kEncoderAttentionMaskCacheCapacity>
+      attention_mask_cache_;
 };
 TORCH_MODULE(OneRecStack);
 

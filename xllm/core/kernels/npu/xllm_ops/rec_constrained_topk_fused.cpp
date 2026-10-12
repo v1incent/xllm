@@ -72,7 +72,7 @@ std::optional<std::string> fused_inputs_unsupported_reason(
   if (!logits.defined() || logits.dim() != 2 || logits.numel() == 0) {
     return "logits must be defined non-empty 2-D";
   }
-  if (current_step < 0 || current_step > 2 || top_k <= 0 || top_k > 1024) {
+  if (current_step < 0 || current_step > 2 || top_k <= 0 || top_k > 512) {
     return "current_step/top_k out of supported range";
   }
   const torch::ScalarType logits_dtype = logits.scalar_type();

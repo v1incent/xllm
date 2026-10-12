@@ -80,6 +80,26 @@ DEFINE_uint32(rec_worker_max_concurrency,
               "Concurrency for rec worker parallel execution. Less than or "
               "equal to 1 means disable concurrent rec worker.");
 
+DEFINE_bool(enable_onerec_prefill_acl_graph,
+            false,
+            "Enable OneRec decoder prefill ACL graph replay.");
+DEFINE_bool(enable_multistream_perf_mode,
+            false,
+            "Enable OneRec multistream execution optimizations.");
+DEFINE_bool(enable_onerec_async_perf,
+            false,
+            "Defer OneRec stream synchronization until output consumption.");
+DEFINE_bool(enable_onerec_multistream_core_split,
+            false,
+            "Assign core quotas to concurrent OneRec streams.");
+DEFINE_double(onerec_multistream_core_ratio,
+              0.5,
+              "Fraction of device cores assigned to each OneRec stream.");
+DEFINE_string(constrained_decoding_filter_path,
+              "",
+              "REC constrained decoding dictionary path, relative to the model "
+              "directory or absolute.");
+
 namespace xllm {
 
 void RecConfig::from_flags() {
@@ -96,6 +116,12 @@ void RecConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(total_conversion_threshold);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(request_queue_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(rec_worker_max_concurrency);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_onerec_prefill_acl_graph);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_multistream_perf_mode);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_onerec_async_perf);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_onerec_multistream_core_split);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(onerec_multistream_core_ratio);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(constrained_decoding_filter_path);
 }
 
 void RecConfig::from_json(const JsonReader& json) {
@@ -112,6 +138,12 @@ void RecConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(total_conversion_threshold);
   XLLM_CONFIG_ASSIGN_FROM_JSON(request_queue_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(rec_worker_max_concurrency);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_onerec_prefill_acl_graph);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_multistream_perf_mode);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_onerec_async_perf);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_onerec_multistream_core_split);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(onerec_multistream_core_ratio);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(constrained_decoding_filter_path);
 }
 
 void RecConfig::append_config_json(nlohmann::ordered_json& config_json) const {
@@ -142,6 +174,18 @@ void RecConfig::append_config_json(nlohmann::ordered_json& config_json) const {
       config_json, default_config, request_queue_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, rec_worker_max_concurrency);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_onerec_prefill_acl_graph);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_multistream_perf_mode);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_onerec_async_perf);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_onerec_multistream_core_split);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, onerec_multistream_core_ratio);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, constrained_decoding_filter_path);
 }
 
 RecConfig& RecConfig::get_instance() {

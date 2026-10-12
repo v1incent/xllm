@@ -395,8 +395,15 @@ Master::Master(const Options& options, EngineType type)
   // logical device from the process-visible devices while keeping node_rank as
   // the global distributed identity.
   const int32_t visible_device_count = Platform::device_count();
-  const int32_t device_idx = DeviceNameUtils::get_device_idx(
+  int32_t device_idx = DeviceNameUtils::get_device_idx(
       options_.node_rank(), options_.nnodes(), visible_device_count);
+  if (options_.rec_device_index() >= 0) {
+    CHECK(type == EngineType::REC && options_.is_local() &&
+          options_.nnodes() == 1)
+        << "Explicit REC device selection requires a local single-node engine";
+    CHECK_LT(options_.rec_device_index(), visible_device_count);
+    device_idx = options_.rec_device_index();
+  }
   const auto visible_devices = DeviceNameUtils::parse_devices("auto");
   const std::vector<torch::Device> devices = {visible_devices[device_idx]};
   // World size is the node count (one worker per process).

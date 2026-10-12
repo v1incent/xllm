@@ -25,9 +25,7 @@ limitations under the License.
 #include <cstdint>
 #include <limits>
 #include <optional>
-#include <random>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "core/common/global_flags.h"
@@ -38,8 +36,9 @@ limitations under the License.
 #include "core/framework/multimodal/embedding_output.h"
 #include "core/framework/multimodal/mm_visitor.h"
 #include "core/framework/prefix_cache/block_hasher.h"
-#include "core/framework/tokenizer/rec_tokenizer.h"
+#include "core/framework/request/rec_item_utils.h"
 #include "core/framework/tokenizer/tokenizer.h"
+#include "core/util/rec_model_utils.h"
 #include "core/util/slice.h"
 #include "core/util/tensor_helper.h"
 #include "rec_type.h"
@@ -51,64 +50,6 @@ constexpr size_t kDecoderBosTokenCount = 1;
 constexpr size_t kDecoderMaxTokenCount = kRecTotalSteps + kDecoderBosTokenCount;
 constexpr char kEmptyLogprobsFinishReason[] = "empty_logprobs";
 
-std::vector<int64_t> normalize_rec_item_ids(const std::vector<int64_t>& raw_ids,
-                                            size_t sequence_index) {
-  std::vector<int64_t> item_ids;
-  item_ids.reserve(raw_ids.size());
-  std::unordered_set<int64_t> seen_item_ids;
-  for (const int64_t item_id : raw_ids) {
-    if (seen_item_ids.insert(item_id).second) {
-      item_ids.emplace_back(item_id);
-    }
-  }
-
-  const int32_t each_threshold =
-      ::xllm::RecConfig::get_instance().each_conversion_threshold();
-  if (each_threshold > 0 &&
-      static_cast<int32_t>(item_ids.size()) > each_threshold) {
-    uint32_t seed =
-        ::xllm::ExecutionConfig::get_instance().random_seed() >= 0
-            ? static_cast<uint32_t>(
-                  ::xllm::ExecutionConfig::get_instance().random_seed()) +
-                  static_cast<uint32_t>(sequence_index)
-            : std::random_device{}();
-    std::mt19937 generator(seed);
-    std::shuffle(item_ids.begin(), item_ids.end(), generator);
-    item_ids.resize(each_threshold);
-  }
-
-  return item_ids;
-}
-
-std::vector<RecItemInfo> normalize_rec_item_infos(
-    const std::vector<RecItemInfo>& raw_item_infos,
-    size_t sequence_index) {
-  std::vector<RecItemInfo> item_infos;
-  item_infos.reserve(raw_item_infos.size());
-  std::unordered_set<int64_t> seen_item_ids;
-  for (const RecItemInfo& item_info : raw_item_infos) {
-    if (seen_item_ids.insert(item_info.item_id).second) {
-      item_infos.emplace_back(item_info);
-    }
-  }
-
-  const int32_t each_threshold =
-      ::xllm::RecConfig::get_instance().each_conversion_threshold();
-  if (each_threshold > 0 &&
-      static_cast<int32_t>(item_infos.size()) > each_threshold) {
-    uint32_t seed =
-        ::xllm::ExecutionConfig::get_instance().random_seed() >= 0
-            ? static_cast<uint32_t>(
-                  ::xllm::ExecutionConfig::get_instance().random_seed()) +
-                  static_cast<uint32_t>(sequence_index)
-            : std::random_device{}();
-    std::mt19937 generator(seed);
-    std::shuffle(item_infos.begin(), item_infos.end(), generator);
-    item_infos.resize(each_threshold);
-  }
-
-  return item_infos;
-}
 }  // namespace
 
 const std::string Sequence::ENCODER_SPARSE_EMBEDDING_NAME = "sparse_embedding";
@@ -187,41 +128,8 @@ void Sequence::generate_onerec_output(const Slice<int32_t>& ids,
       }
     }
   }
-  const size_t rec_token_size = static_cast<size_t>(REC_TOKEN_SIZE);
-  if (::xllm::RecConfig::get_instance().enable_convert_tokens_to_item() &&
-      output.token_ids.size() == rec_token_size) {
-    const Slice<int32_t> token_slice{output.token_ids.data(),
-                                     output.token_ids.size()};
-    if (::xllm::RecConfig::get_instance().enable_extended_item_info()) {
-      const auto* rec_tokenizer = dynamic_cast<const RecTokenizer*>(&tokenizer);
-      if (rec_tokenizer != nullptr) {
-        std::vector<RecItemInfo> item_infos;
-        const bool ok =
-            rec_tokenizer->decode_item_infos(token_slice, &item_infos);
-        if (ok && !item_infos.empty()) {
-          output.item_infos_list = normalize_rec_item_infos(item_infos, index_);
-          output.item_ids_list.reserve(output.item_infos_list.size());
-          for (const RecItemInfo& item_info : output.item_infos_list) {
-            output.item_ids_list.emplace_back(item_info.item_id);
-          }
-          if (!output.item_infos_list.empty()) {
-            output.item_ids = output.item_ids_list.front();
-            output.item_info = output.item_infos_list.front();
-          }
-        }
-      }
-    } else {
-      std::vector<int64_t> item_ids;
-      const bool ok = tokenizer.decode(
-          token_slice, sequence_params_.skip_special_tokens, &item_ids);
-      if (ok && !item_ids.empty()) {
-        output.item_ids_list = normalize_rec_item_ids(item_ids, index_);
-        if (!output.item_ids_list.empty()) {
-          output.item_ids = output.item_ids_list.front();
-        }
-      }
-    }
-  }
+  decode_rec_items(
+      tokenizer, sequence_params_.skip_special_tokens, index_, output);
 }
 
 Sequence::Sequence(size_t index,
@@ -771,15 +679,19 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
     return output;
   }
 
+  if (is_onerec_model() && is_onerec_single_step_mode()) {
+    output.index = index_;
+    output.embedding = output_embedding_;
+    output.finish_reason = finish_reason_.to_string();
+    return output;
+  }
+
   // NOTE: enable_schedule_overlap will generate an extra '-1' token.
   // we need to ignore these '-1' tokens.
   const auto ids = tokens();
-  size_t size;
-  for (auto i = num_tokens_ - 1; i >= 0; --i) {
-    if (tokens_[i] >= 0) {
-      size = i + 1;
-      break;
-    }
+  size_t size = num_tokens_;
+  while (size > 0 && tokens_[size - 1] < 0) {
+    --size;
   }
 
   // 3. generate onerec output

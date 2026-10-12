@@ -34,6 +34,7 @@ limitations under the License.
 namespace xllm {
 
 struct ModelArgs;
+class OneRecBatchInputBuilderCache;
 
 static uint64_t batch_counter_ = 1;
 constexpr uint64_t UNINITIALIZED_BATCH_ID = 0x0;
@@ -80,6 +81,11 @@ class Batch {
   bool empty() const { return sequences_.empty() && sequence_groups_.empty(); }
 
   Sequence* operator[](size_t i) { return sequences_[i]; }
+
+  void set_onerec_batch_input_builder_cache(
+      OneRecBatchInputBuilderCache* cache) {
+    onerec_batch_input_builder_cache_ = cache;
+  }
 
   // prepare forward inputs
   ForwardInput prepare_forward_input(uint32_t num_decoding_tokens,
@@ -142,6 +148,7 @@ class Batch {
   std::vector<Sequence*> get_sequences();
 
  private:
+  OneRecBatchInputBuilderCache* onerec_batch_input_builder_cache_ = nullptr;
   struct OutputTarget {
     Sequence* sequence = nullptr;
     size_t sample_id = 0;

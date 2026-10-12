@@ -1,4 +1,4 @@
-/* Copyright 2025-2026 The xLLM Authors.
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ limitations under the License.
 
 #pragma once
 
-#include "onerec_batch_input_builder.h"
+#include "core/framework/batch/onerec_batch_input_builder.h"
 
 namespace xllm {
 
@@ -34,7 +34,8 @@ class OneRecXAttentionBatchInputBuilder final : public OneRecBatchInputBuilder {
       const uint64_t batch_id,
       const ModelArgs* args,
       BatchForwardType batch_forward_type,
-      MPMCThreadPool* thread_pool = nullptr)
+      MPMCThreadPool* thread_pool,
+      OneRecBatchInputBuilderCache* perf_cache)
       : OneRecBatchInputBuilder(sequence_groups,
                                 allowed_max_tokens,
                                 input_embeddings_vec,
@@ -43,7 +44,8 @@ class OneRecXAttentionBatchInputBuilder final : public OneRecBatchInputBuilder {
                                 batch_id,
                                 args,
                                 batch_forward_type,
-                                thread_pool),
+                                thread_pool,
+                                perf_cache),
         sequence_groups_(sequence_groups),
         allowed_max_tokens_(allowed_max_tokens),
         args_(args) {}

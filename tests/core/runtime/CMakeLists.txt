@@ -169,3 +169,10 @@ if(USE_DCU)
       hip::host
   )
 endif()
+
+cc_test(
+  NAME rec_beam_utils_test
+  NO_NPU_INIT
+  SRCS rec_beam_utils_test.cpp
+  DEPS torch glog::glog GTest::gtest_main
+)

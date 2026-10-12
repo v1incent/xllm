@@ -76,7 +76,8 @@ std::unique_ptr<BlockManager> maybe_concurrent(
     std::unique_ptr<BlockManager> leaf,
     const BlockManager::Options& options) {
   if (options.enable_disagg_pd() || options.enable_kvcache_store() ||
-      options.enable_host_offload()) {
+      options.enable_host_offload() ||
+      options.enable_concurrent_allocations()) {
     return std::make_unique<ConcurrentBlockManagerImpl>(std::move(leaf));
   }
   return leaf;

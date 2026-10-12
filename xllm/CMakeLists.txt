@@ -70,6 +70,7 @@ if(GENERATE_SO)
       c_api/internal/llm.cpp
       c_api/internal/rec.cpp
       c_api/internal/helper.cpp
+      c_api/internal/rec_tensor.cpp
     DEPS
       :config
       :master
@@ -79,6 +80,12 @@ if(GENERATE_SO)
       glog::glog
       Folly::folly
       nlohmann_json::nlohmann_json
+  )
+
+  cc_binary(
+    NAME test_query_rec_input_tensors
+    SRCS c_api/examples/test_query_rec_input_tensors.cpp
+    DEPS xllm
   )
 
 else()
@@ -125,6 +132,12 @@ if(USE_MUSA)
   target_link_options(xllm PRIVATE
     "LINKER:--whole-archive,$<TARGET_FILE:runtime>,--no-whole-archive"
   )
+endif()
+
+if(GENERATE_SO)
+  # The C ABI owns its implementation dependencies. Propagating their static
+  # archives to consumers can register the same Torch operators twice.
+  set_property(TARGET xllm PROPERTY INTERFACE_LINK_LIBRARIES "")
 endif()
 
 # install xllm

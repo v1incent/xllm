@@ -73,6 +73,8 @@ struct XLLM_REC_Handler {
 namespace xllm {
 namespace helper {
 
+std::string resolve_request_id(const XLLM_RequestParams* params);
+
 enum class BackendType { LLM = 0, VLM = 1, REC = 2 };
 
 enum class InferenceType {
@@ -135,6 +137,21 @@ XLLM_Response* build_success_response(const InferenceType& inference_type,
                                       const std::string& request_id,
                                       int64_t created_time,
                                       const std::string& model);
+
+// Tensor input/output support for embedded OneRec callers.
+bool convert_c_infer_input_tensors_to_onerec_mm_data(
+    const XLLM_InferInputTensorDesc* tensors,
+    size_t tensor_count,
+    MMData* mm_data,
+    std::string* error_info);
+
+bool populate_raw_output_tensors(InferenceType inference_type,
+                                 const RequestOutput& output,
+                                 XLLM_Response* response);
+
+void copy_rec_output_extended_strings(XLLM_RecOutput* rec_output,
+                                      const SequenceOutput& output,
+                                      size_t copied_item_count);
 
 /**
  * @brief Generic inference request handler (template function)

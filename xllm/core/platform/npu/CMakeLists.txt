@@ -8,12 +8,15 @@ cc_library(
     npu_batch_memcpy.h
     device_capture_lock.h
     acl_graph_task_update_context.h
+    python_runtime.h
   SRCS
     npu_layer_synchronizer.cpp
     npu_batch_memcpy.cpp
+    python_runtime.cpp
   DEPS
     torch_npu
     glog::glog
     torch
     ascendcl
+    Python::Python
 )

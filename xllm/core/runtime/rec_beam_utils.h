@@ -1,0 +1,146 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <glog/logging.h>
+#include <torch/torch.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+namespace xllm::runtime::detail {
+
+// Internal beam histories contain generated tokens only, with no prompt/BOS.
+// Prefill has one logit row per request; decode has one row per surviving beam.
+inline std::vector<std::vector<int32_t>> beam_constraint_prefixes(
+    const torch::Tensor& sequence_group,
+    int32_t current_step) {
+  CHECK_EQ(sequence_group.dim(), 3);
+  CHECK_GE(current_step, 0);
+  CHECK_LT(current_step, sequence_group.size(2));
+  const int64_t batch_size = sequence_group.size(0);
+  if (current_step == 0) {
+    return std::vector<std::vector<int32_t>>(batch_size);
+  }
+  const int64_t rows = batch_size * sequence_group.size(1);
+  // Blocking copy on the caller's stream observes the preceding beam reorder.
+  const auto prefixes = sequence_group.slice(2, 0, current_step)
+                            .to(torch::kCPU, torch::kInt32)
+                            .contiguous()
+                            .view({rows, current_step});
+  const int32_t* data = prefixes.data_ptr<int32_t>();
+  std::vector<std::vector<int32_t>> result;
+  result.reserve(rows);
+  for (int64_t row = 0; row < rows; ++row) {
+    const int32_t* begin = data + row * current_step;
+    result.emplace_back(begin, begin + current_step);
+  }
+  return result;
+}
+
+inline void write_first_round_beam_outputs(
+    const torch::Tensor& flat_top_tokens,
+    const torch::Tensor& flat_top_logprobs,
+    int32_t batch_size,
+    torch::Tensor& out_token_ids,
+    torch::Tensor& out_log_probs,
+    torch::Tensor& out_seqgroup) {
+  CHECK_EQ(flat_top_tokens.dim(), 2)
+      << "flat_top_tokens must be [batch * beam, 1], got "
+      << flat_top_tokens.sizes();
+  CHECK_EQ(flat_top_logprobs.dim(), 2)
+      << "flat_top_logprobs must be [batch * beam, 1], got "
+      << flat_top_logprobs.sizes();
+  CHECK_EQ(flat_top_tokens.sizes(), flat_top_logprobs.sizes())
+      << "flat_top_tokens/top_logprobs shape mismatch";
+  CHECK_EQ(flat_top_tokens.size(0), out_token_ids.size(0))
+      << "top_tokens/out_token_ids rows mismatch";
+  CHECK_EQ(flat_top_logprobs.size(0), out_log_probs.size(0))
+      << "top_logprobs/out_log_probs rows mismatch";
+  CHECK_EQ(flat_top_tokens.size(1), 1)
+      << "first-round top_tokens must have exactly one column";
+  CHECK_EQ(flat_top_logprobs.size(1), 1)
+      << "first-round top_logprobs must have exactly one column";
+  CHECK_GT(batch_size, 0) << "batch_size must be positive";
+  CHECK_EQ(flat_top_tokens.size(0) % batch_size, 0)
+      << "top_tokens rows must be divisible by batch_size";
+  CHECK_EQ(out_seqgroup.dim(), 3)
+      << "out_seqgroup must be [batch, beam, rounds], got "
+      << out_seqgroup.sizes();
+  CHECK_EQ(out_seqgroup.size(0), batch_size) << "out_seqgroup batch mismatch";
+
+  const int64_t beam_width = flat_top_tokens.size(0) / batch_size;
+  CHECK_EQ(out_seqgroup.size(1), beam_width) << "out_seqgroup beam mismatch";
+
+  out_token_ids.copy_(flat_top_tokens);
+  out_log_probs.copy_(flat_top_logprobs);
+  out_seqgroup.select(/*dim=*/2, /*index=*/0)
+      .copy_(flat_top_tokens.view({batch_size, beam_width}));
+}
+
+// Parent indices are global rows in the previous [batch * beam] tensor.
+// Reorder the full history before appending the selected token's conditional
+// logprob; output scores from beam search are cumulative, not per-token.
+inline void write_beam_round_step_logprobs(
+    const torch::Tensor& out_log_probs,
+    const torch::Tensor& previous_acc_logprobs,
+    const torch::Tensor& parent_indices,
+    int32_t batch_size,
+    int32_t round,
+    torch::Tensor& token_step_logprobs) {
+  if (!token_step_logprobs.defined()) {
+    return;
+  }
+  CHECK_GT(batch_size, 0);
+  CHECK_EQ(out_log_probs.dim(), 2);
+  CHECK_EQ(out_log_probs.size(1), 1);
+  CHECK_EQ(out_log_probs.size(0) % batch_size, 0);
+  CHECK_EQ(token_step_logprobs.dim(), 3);
+  CHECK_EQ(token_step_logprobs.size(0), batch_size);
+  CHECK_GE(round, 0);
+  CHECK_LT(round, token_step_logprobs.size(2));
+  const int64_t result_width = out_log_probs.size(0) / batch_size;
+  const int64_t total_rounds = token_step_logprobs.size(2);
+  auto scores = out_log_probs.reshape({batch_size, result_width});
+  if (round == 0) {
+    token_step_logprobs = torch::zeros({batch_size, result_width, total_rounds},
+                                       token_step_logprobs.options());
+    token_step_logprobs.select(2, 0).copy_(scores);
+    return;
+  }
+  CHECK_EQ(parent_indices.numel(), out_log_probs.numel());
+  CHECK_EQ(previous_acc_logprobs.numel(),
+           batch_size * token_step_logprobs.size(1));
+  const auto parents = parent_indices.reshape({-1}).to(torch::kInt64);
+  auto history = token_step_logprobs.reshape({-1, total_rounds})
+                     .index_select(0, parents)
+                     .reshape({batch_size, result_width, total_rounds});
+  const auto parent_scores = previous_acc_logprobs.reshape({-1})
+                                 .index_select(0, parents)
+                                 .reshape({batch_size, result_width});
+  // A masked parent may have -inf cumulative probability. Keep its children
+  // invalid instead of producing NaN from -inf - -inf.
+  const auto conditional_scores = torch::where(
+      torch::isfinite(parent_scores),
+      scores - parent_scores,
+      torch::full_like(scores, -std::numeric_limits<float>::infinity()));
+  history.select(2, round).copy_(conditional_scores);
+  token_step_logprobs = std::move(history);
+}
+
+}  // namespace xllm::runtime::detail

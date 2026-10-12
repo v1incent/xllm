@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/util/scope_guard.h"
 #include "distributed_runtime/engine.h"
 #include "framework/batch/batch.h"
 #include "framework/batch/batch_factory.h"
@@ -71,11 +72,24 @@ void FixedStepsScheduler::handle_prefill_requests(
   bool blocks_exhausted = false;
   const bool requires_kv_cache =
       scheduler_pipeline_ && scheduler_pipeline_->requires_kv_cache();
+  const size_t max_prefill_requests_per_step =
+      scheduler_pipeline_ != nullptr
+          ? std::max<size_t>(
+                1, scheduler_pipeline_->max_prefill_requests_per_step(*this))
+          : std::numeric_limits<size_t>::max();
+  const auto can_schedule_under_kv_threshold = [this]() {
+    if (scheduler_pipeline_ == nullptr ||
+        !scheduler_pipeline_->respects_prefill_memory_threshold(*this)) {
+      return true;
+    }
+    return kv_cache_manager_->kv_cache_utilization() <
+           SchedulerConfig::get_instance()
+               .prefill_scheduling_memory_usage_threshold();
+  };
   while (!prefill_queue_->empty() && remaining_seq_budget > 0 &&
          remaining_token_budget > 0 &&
-         kv_cache_manager_->kv_cache_utilization() <
-             ::xllm::SchedulerConfig::get_instance()
-                 .prefill_scheduling_memory_usage_threshold()) {
+         running_requests_.size() < max_prefill_requests_per_step &&
+         can_schedule_under_kv_threshold()) {
     std::shared_ptr<Request> request(prefill_queue_->top());
     if (request->finished() || request->cancelled()) {
       if (requires_kv_cache) {
@@ -161,8 +175,13 @@ void FixedStepsScheduler::handle_prefill_requests(
                                       prefill_sequences_budget.end());
   }
 
+  const bool resource_temporarily_exhausted =
+      blocks_exhausted || !can_schedule_under_kv_threshold();
+  const bool should_defer_resource_exhausted =
+      resource_temporarily_exhausted && scheduler_pipeline_ != nullptr &&
+      scheduler_pipeline_->should_defer_resource_exhausted(*this);
   if (running_sequences_.empty() && !prefill_queue_->empty() &&
-      decode_queue_->empty()) {
+      !should_defer_resource_exhausted && decode_queue_->empty()) {
     LOG(ERROR)
         << "Request prompt is too long, no enough budget/memory to schedule "
            "a single sequence.";
@@ -365,6 +384,12 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
                      batches = std::move(result.batches),
                      requests = std::move(result.requests),
                      sequences = std::move(result.sequences)]() mutable {
+      ScopeGuard step_guard([this]() {
+        if (options_.rec_worker_max_concurrency() > 1) {
+          in_flight_steps_.fetch_sub(1, std::memory_order_acq_rel);
+          step_semaphore_.release();
+        }
+      });
       engine_->step(batches);
 
       // After step completes, check and process finished/cancelled requests
@@ -383,14 +408,11 @@ void FixedStepsScheduler::step(const absl::Duration& timeout) {
       if (!finished_requests.empty()) {
         response_processor_->process_completed_requests(finished_requests);
       }
-
-      if (options_.rec_worker_max_concurrency() > 1) {
-        step_semaphore_.release();
-      }
     };
 
     if (options_.rec_worker_max_concurrency() > 1) {
       step_semaphore_.acquire();
+      in_flight_steps_.fetch_add(1, std::memory_order_acq_rel);
       step_threadpool_->schedule(function);
     } else {
       function();
@@ -450,26 +472,37 @@ FixedStepsScheduler::OneRecXAttentionSchedulerPipeline::create_batches(
       scheduler.kv_cache_manager_->get_swap_block_transfer_infos());
 }
 
+size_t FixedStepsScheduler::OneRecXAttentionSchedulerPipeline::
+    max_prefill_requests_per_step(const FixedStepsScheduler& scheduler) const {
+  if (scheduler.options_.rec_worker_max_concurrency() > 1) {
+    return 1;
+  }
+  return std::numeric_limits<size_t>::max();
+}
+
 bool FixedStepsScheduler::OneRecXAttentionSchedulerPipeline::allocate_kv_cache(
     KVCacheManager* kv_cache_manager,
     Sequence* sequence) {
-  const size_t num_tokens = sequence->num_tokens();
-  size_t max_generated_tokens =
-      ::xllm::RecConfig::get_instance().max_decode_rounds() > 0
-          ? static_cast<size_t>(
-                ::xllm::RecConfig::get_instance().max_decode_rounds())
-          : kRecDecodeSteps;
-  if (const auto* stopping_checker = sequence->stopping_checker()) {
-    max_generated_tokens = std::max(
-        max_generated_tokens, stopping_checker->get_max_generated_tokens());
-  }
-  if (std::numeric_limits<size_t>::max() - num_tokens < max_generated_tokens) {
-    LOG(ERROR) << "Integer overflow detected in OneRec xattention KV cache "
-                  "allocation";
+  const size_t encoder_tokens = sequence->encoder_seq_len();
+  if (encoder_tokens == 0) {
+    LOG(ERROR) << "OneRec xattention Cross KV cache requires non-empty encoder "
+                  "input.";
     return false;
   }
-  return kv_cache_manager->allocate(sequence,
-                                    num_tokens + max_generated_tokens);
+  return kv_cache_manager->allocate(sequence, encoder_tokens);
+}
+
+bool FixedStepsScheduler::OneRecXAttentionSchedulerPipeline::
+    respects_prefill_memory_threshold(
+        const FixedStepsScheduler& scheduler) const {
+  return scheduler.options_.rec_worker_max_concurrency() <= 1;
+}
+
+bool FixedStepsScheduler::OneRecXAttentionSchedulerPipeline::
+    should_defer_resource_exhausted(
+        const FixedStepsScheduler& scheduler) const {
+  return scheduler.options_.rec_worker_max_concurrency() > 1 &&
+         scheduler.in_flight_steps_.load(std::memory_order_acquire) > 0;
 }
 
 std::vector<Batch>

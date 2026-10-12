@@ -10,7 +10,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "helper.h"
+#include "c_api/internal/helper.h"
 
 #include <glog/logging.h>
 #include <pthread.h>
@@ -22,11 +22,22 @@ limitations under the License.
 #include "core/common/global_flags.h"
 #include "core/framework/config/rec_config.h"
 #include "core/util/env_var.h"
+#include "core/util/rec_infer_timing.h"
 #include "core/util/rec_model_utils.h"
+#include "core/util/timer.h"
 #include "core/util/uuid.h"
 
 namespace xllm {
 namespace helper {
+
+std::string resolve_request_id(const XLLM_RequestParams* params) {
+  if (params != nullptr && params->request_id[0] != '\0') {
+    return std::string(params->request_id,
+                       strnlen(params->request_id, sizeof(params->request_id)));
+  }
+  return generate_request_id();
+}
+
 namespace {
 thread_local ShortUUID short_uuid;
 static std::atomic<bool> g_glog_inited = false;
@@ -166,7 +177,10 @@ XLLM_Response* build_success_response(const InferenceType& inference_type,
                                       const std::string& request_id,
                                       int64_t created_time,
                                       const std::string& model) {
+  Timer response_timer;
   XLLM_Response* response = new XLLM_Response();
+  std::unique_ptr<XLLM_Response, decltype(&xllm_free_response)> response_guard(
+      response, xllm_free_response);
   CHECK(nullptr != response);
 
   response->status_code = XLLM_StatusCode::kSuccess;
@@ -275,6 +289,8 @@ XLLM_Response* build_success_response(const InferenceType& inference_type,
           for (size_t j = 0; j < copied_item_count; ++j) {
             rec_output->item_ids[j] = seq_output.item_ids_list[j];
           }
+          copy_rec_output_extended_strings(
+              rec_output, seq_output, copied_item_count);
           total_item_count += static_cast<int32_t>(copied_item_count);
         }
       } else if (seq_output.item_ids.has_value() &&
@@ -283,6 +299,7 @@ XLLM_Response* build_success_response(const InferenceType& inference_type,
         rec_output->item_ids = new int64_t[1];
         CHECK(nullptr != rec_output->item_ids);
         rec_output->item_ids[0] = seq_output.item_ids.value();
+        copy_rec_output_extended_strings(rec_output, seq_output, 1);
         ++total_item_count;
       }
     }
@@ -314,7 +331,14 @@ XLLM_Response* build_success_response(const InferenceType& inference_type,
     response->usage.cached_tokens = usage.num_cached_tokens;
   }
 
-  return response;
+  populate_raw_output_tensors(inference_type, output, response);
+  if (inference_type == InferenceType::REC_COMPLETIONS ||
+      inference_type == InferenceType::REC_CHAT_COMPLETIONS) {
+    rec_infer_timing::set_build_response_us(
+        request_id,
+        static_cast<int64_t>(response_timer.elapsed_microseconds()));
+  }
+  return response_guard.release();
 }
 
 template <typename HandlerType, typename InputType>
@@ -328,12 +352,7 @@ XLLM_Response* handle_inference_request(
     const XLLM_RequestParams* request_params) {
   CHECK(nullptr != handler);
 
-  std::string request_id;
-  if (nullptr != request_params && strlen(request_params->request_id) > 0) {
-    request_id = request_params->request_id;
-  } else {
-    request_id = generate_request_id();
-  }
+  const std::string request_id = resolve_request_id(request_params);
 
   if (!handler->initialized) {
     return build_error_response(
@@ -363,46 +382,60 @@ XLLM_Response* handle_inference_request(
   const int64_t created_time = absl::ToUnixSeconds(absl::Now());
 
   try {
-    auto promise_ptr = std::make_shared<folly::Promise<XLLM_Response*>>();
+    using ResponsePtr =
+        std::unique_ptr<XLLM_Response, decltype(&xllm_free_response)>;
+    auto promise_ptr = std::make_shared<folly::Promise<ResponsePtr>>();
     auto future = promise_ptr->getSemiFuture();
+    auto completed = std::make_shared<std::atomic<bool>>(false);
 
     auto on_request_complete = [model_id,
                                 request_id,
                                 created_time,
                                 inference_type,
                                 rec_pipeline_type,
+                                completed,
                                 weak_promise = std::weak_ptr(promise_ptr)](
                                    const RequestOutput& req_output) -> bool {
       if (auto locked_promise = weak_promise.lock()) {
+        if (completed->exchange(true, std::memory_order_acq_rel)) {
+          return false;
+        }
         try {
           if (req_output.status.has_value()) {
             if (req_output.status.value().ok()) {
-              locked_promise->setValue(build_success_response(inference_type,
-                                                              req_output,
-                                                              rec_pipeline_type,
-                                                              request_id,
-                                                              created_time,
-                                                              model_id));
+              locked_promise->setValue(
+                  ResponsePtr(build_success_response(inference_type,
+                                                     req_output,
+                                                     rec_pipeline_type,
+                                                     request_id,
+                                                     created_time,
+                                                     model_id),
+                              xllm_free_response));
             } else {
-              locked_promise->setValue(build_error_response(
-                  request_id,
-                  XLLM_StatusCode::kInternalError,
-                  "RequestOutput status is not ok, message: " +
-                      req_output.status.value().message()));
+              locked_promise->setValue(
+                  ResponsePtr(build_error_response(
+                                  request_id,
+                                  XLLM_StatusCode::kInternalError,
+                                  "RequestOutput status is not ok, message: " +
+                                      req_output.status.value().message()),
+                              xllm_free_response));
             }
           } else {
-            locked_promise->setValue(
+            locked_promise->setValue(ResponsePtr(
                 build_error_response(request_id,
                                      XLLM_StatusCode::kInternalError,
-                                     "RequestOutput status has no value"));
+                                     "RequestOutput status has no value"),
+                xllm_free_response));
           }
           return true;
         } catch (const std::exception& e) {
           LOG(ERROR) << "Build response failed: " << e.what();
-          locked_promise->setValue(build_error_response(
-              request_id,
-              XLLM_StatusCode::kInternalError,
-              "Build response failed: " + std::string(e.what())));
+          locked_promise->setValue(ResponsePtr(
+              build_error_response(
+                  request_id,
+                  XLLM_StatusCode::kInternalError,
+                  "Build response failed: " + std::string(e.what())),
+              xllm_free_response));
         }
       }
       return false;
@@ -415,7 +448,10 @@ XLLM_Response* handle_inference_request(
                                       std::nullopt,
                                       on_request_complete);
     } else if constexpr (std::is_same_v<HandlerType, XLLM_REC_Handler>) {
-      if constexpr (std::is_same_v<InputType, std::vector<int>>) {
+      if constexpr (std::is_same_v<InputType, MMData>) {
+        handler->master->handle_request(
+            input, xllm_request_params, on_request_complete);
+      } else if constexpr (std::is_same_v<InputType, std::vector<int>>) {
         if (nullptr != extra) {
           xllm::MMData* mm_data =
               dynamic_cast<xllm::MMData*>(static_cast<xllm::MMData*>(extra));
@@ -443,27 +479,32 @@ XLLM_Response* handle_inference_request(
       CHECK(false);
     }
 
-    return std::move(future)
-        .via(handler->executor.get())
-        .within(std::chrono::milliseconds(timeout_ms))
-        .thenTry([request_id](
-                     folly::Try<XLLM_Response*>&& result) -> XLLM_Response* {
-          if (result.hasValue()) return std::move(result).value();
+    auto response_future = std::move(future).via(handler->executor.get());
+    if (timeout_ms > 0) {
+      response_future = std::move(response_future)
+                            .within(std::chrono::milliseconds(timeout_ms));
+    }
+    return std::move(response_future)
+        .thenTry(
+            [request_id](folly::Try<ResponsePtr>&& result) -> XLLM_Response* {
+              if (result.hasValue()) {
+                return std::move(result).value().release();
+              }
 
-          std::string error_msg;
-          XLLM_StatusCode code = XLLM_StatusCode::kInternalError;
-          try {
-            result.throwUnlessValue();
-          } catch (const folly::FutureTimeout& e) {
-            error_msg = "Request timed out: " + std::string(e.what());
-            code = XLLM_StatusCode::kTimeout;
-          } catch (const std::exception& e) {
-            error_msg = "Inference failed: " + std::string(e.what());
-          } catch (...) {
-            error_msg = "Inference failed with unknown exception";
-          }
-          return build_error_response(request_id, code, error_msg);
-        })
+              std::string error_msg;
+              XLLM_StatusCode code = XLLM_StatusCode::kInternalError;
+              try {
+                result.throwUnlessValue();
+              } catch (const folly::FutureTimeout& e) {
+                error_msg = "Request timed out: " + std::string(e.what());
+                code = XLLM_StatusCode::kTimeout;
+              } catch (const std::exception& e) {
+                error_msg = "Inference failed: " + std::string(e.what());
+              } catch (...) {
+                error_msg = "Inference failed with unknown exception";
+              }
+              return build_error_response(request_id, code, error_msg);
+            })
         .get();
 
   } catch (...) {
@@ -473,9 +514,24 @@ XLLM_Response* handle_inference_request(
   }
 }
 
+template XLLM_Response* handle_inference_request<XLLM_REC_Handler, MMData>(
+    XLLM_REC_Handler*,
+    InferenceType,
+    const std::string&,
+    const MMData&,
+    void*,
+    uint32_t,
+    const XLLM_RequestParams*);
+
 void xllm_free_response(XLLM_Response* resp) {
   if (nullptr == resp) {
     return;
+  }
+
+  if (resp->completion_response_proto != nullptr) {
+    delete[] resp->completion_response_proto;
+    resp->completion_response_proto = nullptr;
+    resp->completion_response_proto_size = 0;
   }
 
   if (nullptr != resp->choices.entries) {
@@ -517,6 +573,25 @@ void xllm_free_response(XLLM_Response* resp) {
   if (nullptr != resp->rec_outputs.entries) {
     for (size_t i = 0; i < resp->rec_outputs.entries_size; ++i) {
       XLLM_RecOutput& rec_output = resp->rec_outputs.entries[i];
+      const size_t item_count = rec_output.item_ids_size;
+      if (nullptr != rec_output.item_dids) {
+        for (size_t j = 0; j < item_count; ++j) {
+          if (nullptr != rec_output.item_dids[j]) {
+            delete[] rec_output.item_dids[j];
+          }
+        }
+        delete[] rec_output.item_dids;
+        rec_output.item_dids = nullptr;
+      }
+      if (nullptr != rec_output.item_types) {
+        for (size_t j = 0; j < item_count; ++j) {
+          if (nullptr != rec_output.item_types[j]) {
+            delete[] rec_output.item_types[j];
+          }
+        }
+        delete[] rec_output.item_types;
+        rec_output.item_types = nullptr;
+      }
       if (nullptr != rec_output.item_ids) {
         delete[] rec_output.item_ids;
         rec_output.item_ids = nullptr;
@@ -532,6 +607,30 @@ void xllm_free_response(XLLM_Response* resp) {
     resp->rec_outputs.entries = nullptr;
   }
   resp->rec_outputs.entries_size = 0;
+
+  if (nullptr != resp->output_tensors.entries) {
+    for (size_t i = 0; i < resp->output_tensors.entries_size; ++i) {
+      XLLM_InferOutputTensor& ot = resp->output_tensors.entries[i];
+      if (nullptr != ot.name) {
+        delete[] const_cast<char*>(ot.name);
+        ot.name = nullptr;
+      }
+      if (nullptr != ot.shape) {
+        delete[] const_cast<int64_t*>(ot.shape);
+        ot.shape = nullptr;
+      }
+      if (nullptr != ot.data) {
+        delete[] reinterpret_cast<char*>(const_cast<void*>(ot.data));
+        ot.data = nullptr;
+      }
+      ot.shape_len = 0;
+      ot.num_elements = 0;
+    }
+    delete[] resp->output_tensors.entries;
+    resp->output_tensors.entries = nullptr;
+  }
+  resp->output_tensors.entries_size = 0;
+
   delete resp;
 
   return;

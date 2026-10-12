@@ -44,6 +44,10 @@ class Options {
   // model backend
   PROPERTY(std::string, backend);
 
+  // Explicit logical device for a single-process embedded REC instance.
+  // A negative value preserves the distributed device selection.
+  PROPERTY(int32_t, rec_device_index) = -1;
+
   // max image num per prompt, default 8
   PROPERTY(int32_t, limit_image_per_prompt) = 8;
 

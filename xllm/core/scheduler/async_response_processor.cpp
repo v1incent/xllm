@@ -24,6 +24,8 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/request/rec_type.h"
+#include "core/util/rec_infer_timing.h"
 #include "framework/request/finish_reason.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
@@ -106,11 +108,23 @@ void AsyncResponseProcessor::process_completed_request(
     AUTO_COUNTER(responsing_latency_seconds_non_stream);
 
     double end_2_end_latency_seconds = request->end_to_end_latency_seconds();
+    const bool record_rec_timing = request->state().rec_type != RecType::kNone;
+    if (record_rec_timing) {
+      rec_infer_timing::set_scheduler_infer_us(
+          request->request_id(),
+          static_cast<int64_t>(end_2_end_latency_seconds * 1000000.0));
+    }
     // update the metrics for the request
     HISTOGRAM_OBSERVE(end_2_end_latency_milliseconds,
                       static_cast<int64_t>(end_2_end_latency_seconds * 1000.0));
+    Timer generate_output_timer;
     RequestOutput req_output =
         request->generate_output(*tokenizer_, &generate_output_threadpool_);
+    if (record_rec_timing) {
+      rec_infer_timing::set_generate_output_us(
+          request->request_id(),
+          static_cast<int64_t>(generate_output_timer.elapsed_microseconds()));
+    }
     if (!disable_log_stats_) {
       if (req_output.status.has_value() && !req_output.status->ok()) {
         request->log_error_statistic(req_output.status.value());

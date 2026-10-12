@@ -13,14 +13,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "rec_worker_impl.h"
+// Use the installed CANN declarations before torch_npu imports its bundled ACL.
+#if defined(USE_NPU)
+#include <acl/acl.h>
+#endif
 
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cmath>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -32,7 +38,11 @@ limitations under the License.
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/rec_config.h"
+#include "core/runtime/rec_beam_utils.h"
+#include "core/runtime/rec_worker_impl.h"
+#include "core/util/scope_guard.h"
 #include "framework/model/model_input_params.h"
 #include "util/rec_model_utils.h"
 #if defined(USE_CUDA)
@@ -43,6 +53,8 @@ limitations under the License.
 #include "platform/cuda/device_capture_lock.h"
 #endif
 #if defined(USE_NPU)
+#include <torch_npu/torch_npu.h>
+
 #include "kernels/npu/npu_ops_api.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "platform/npu/device_capture_lock.h"
@@ -59,6 +71,18 @@ limitations under the License.
 namespace xllm {
 
 namespace {
+
+constexpr const char* kOnerecXAttentionSerializeHostStagesEnv =
+    "XLLM_ONEREC_XATTN_SERIALIZE_HOST_STAGES";
+constexpr const char* kOnerecXAttentionSerializePrepareEnv =
+    "XLLM_ONEREC_XATTN_SERIALIZE_PREPARE";
+constexpr const char* kOnerecXAttentionSerializeModelForwardEnv =
+    "XLLM_ONEREC_XATTN_SERIALIZE_MODEL_FORWARD";
+constexpr const char* kOnerecXAttentionAsyncOutputReadyEnv =
+    "XLLM_ONEREC_XATTN_ASYNC_OUTPUT_READY";
+// Keep the legacy environment variable name for launch-config compatibility.
+constexpr const char* kOnerecXAttentionCacheSelectedTokenIdxesEnv =
+    "XLLM_ONEREC_XATTN_CACHE_DECODE_INPUT_TENSORS";
 
 RecVocabDict* get_onerec_vocab_dict(const std::string& model_weights_path) {
   if (model_weights_path.empty()) {
@@ -88,6 +112,194 @@ bool enable_onerec_selected_token_cpu_check() {
 bool enable_onerec_xattention_stage_timing() {
   return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_STAGE_TIMING", false);
 }
+
+bool enable_onerec_xattention_host_stage_timing() {
+  return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_HOST_STAGE_TIMING", false);
+}
+
+bool enable_onerec_xattention_sync_timing() {
+  return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_SYNC_TIMING", false);
+}
+
+bool enable_onerec_xattention_lock_timing() {
+  return util::get_bool_env("XLLM_DEBUG_ONEREC_XATTN_LOCK_TIMING", false);
+}
+
+bool enable_rec_pipeline_concurrency_debug() {
+  return util::get_bool_env("XLLM_DEBUG_REC_PIPELINE_CONCURRENCY", false);
+}
+
+bool serialize_onerec_xattention_host_stages() {
+  static const bool serialize_host_stages =
+      util::get_bool_env(kOnerecXAttentionSerializeHostStagesEnv, true);
+  return serialize_host_stages;
+}
+
+bool serialize_onerec_xattention_prepare() {
+  if (RecConfig::get_instance().enable_multistream_perf_mode()) {
+    return false;
+  }
+  static const bool serialize_prepare =
+      util::get_bool_env(kOnerecXAttentionSerializePrepareEnv,
+                         serialize_onerec_xattention_host_stages());
+  return serialize_prepare;
+}
+
+bool serialize_onerec_xattention_model_forward() {
+  if (RecConfig::get_instance().enable_multistream_perf_mode()) {
+    return false;
+  }
+  static const bool serialize_model_forward =
+      util::get_bool_env(kOnerecXAttentionSerializeModelForwardEnv,
+                         serialize_onerec_xattention_host_stages());
+  return serialize_model_forward;
+}
+
+bool enable_onerec_xattention_async_output_ready() {
+  static const bool async_output_ready =
+      util::get_bool_env(kOnerecXAttentionAsyncOutputReadyEnv, false);
+  return async_output_ready ||
+         RecConfig::get_instance().enable_onerec_async_perf();
+}
+
+bool enable_onerec_xattention_cache_selected_token_idxes() {
+  static const bool cache_selected_token_idxes =
+      util::get_bool_env(kOnerecXAttentionCacheSelectedTokenIdxesEnv, true);
+  return cache_selected_token_idxes;
+}
+
+int synchronize_onerec_xattention_stream(Stream& stream,
+                                         const char* stage_name,
+                                         int32_t round) {
+  if (!enable_onerec_xattention_sync_timing()) {
+    return stream.synchronize();
+  }
+
+  Timer timer;
+  const int ret = stream.synchronize();
+  LOG(INFO) << "OneRec xattention sync timing, stage=" << stage_name
+            << ", round=" << round
+            << ", elapsed_us=" << timer.elapsed_microseconds()
+            << ", ret=" << ret;
+  return ret;
+}
+
+void log_onerec_xattention_host_stage_timing(const char* stage_name,
+                                             int32_t round,
+                                             Timer& timer) {
+  if (!enable_onerec_xattention_host_stage_timing()) {
+    return;
+  }
+  LOG(INFO) << "OneRec xattention host stage timing, stage=" << stage_name
+            << ", round=" << round
+            << ", elapsed_us=" << timer.elapsed_microseconds();
+  timer.reset();
+}
+
+void move_onerec_xattention_output_to_cpu(ForwardOutput& output) {
+  auto& sample_output = output.sample_output;
+  const bool has_beam_output = output.beam_sequence_group.defined() &&
+                               output.beam_sequence_group.numel() > 0;
+  if (!has_beam_output && sample_output.embeddings.defined()) {
+    sample_output.embeddings = safe_to(
+        sample_output.embeddings,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
+        /*non_blocking=*/true);
+  }
+  if (!has_beam_output && sample_output.next_tokens.defined()) {
+    sample_output.next_tokens =
+        safe_to(sample_output.next_tokens, torch::kCPU, /*non_blocking=*/true);
+    if (sample_output.logprobs.defined()) {
+      sample_output.logprobs =
+          safe_to(sample_output.logprobs, torch::kCPU, true);
+    }
+    if (sample_output.top_tokens.defined()) {
+      sample_output.top_tokens =
+          safe_to(sample_output.top_tokens, torch::kCPU, true);
+    }
+    if (sample_output.top_logprobs.defined()) {
+      sample_output.top_logprobs =
+          safe_to(sample_output.top_logprobs, torch::kCPU, true);
+    }
+  }
+  if (has_beam_output) {
+    output.beam_sequence_group =
+        safe_to(output.beam_sequence_group, torch::kCPU, true);
+  }
+  if (output.beam_sequence_group_logprobs.defined() &&
+      output.beam_sequence_group_logprobs.numel() > 0) {
+    output.beam_sequence_group_logprobs =
+        safe_to(output.beam_sequence_group_logprobs, torch::kCPU, true);
+  }
+  if (output.beam_search_output.out_logprobs.defined() &&
+      output.beam_search_output.out_logprobs.numel() > 0) {
+    output.beam_search_output.out_logprobs =
+        safe_to(output.beam_search_output.out_logprobs, torch::kCPU, true);
+  }
+}
+
+#if defined(USE_NPU)
+bool should_serialize_onerec_xattention_prepare(int64_t max_concurrency) {
+  return max_concurrency > 1 && serialize_onerec_xattention_prepare();
+}
+
+bool should_serialize_onerec_xattention_model_forward(int64_t max_concurrency) {
+  return max_concurrency > 1 && serialize_onerec_xattention_model_forward();
+}
+
+uint32_t get_device_core_limit(int32_t device_id,
+                               aclrtDevAttr attr,
+                               double ratio) {
+  int64_t core_count = 0;
+  const aclError status =
+      aclrtGetDeviceInfo(static_cast<uint32_t>(device_id), attr, &core_count);
+  CHECK_EQ(status, ACL_SUCCESS)
+      << "Failed to query NPU core count, attr=" << static_cast<int>(attr);
+  CHECK_GT(core_count, 0) << "NPU core count must be positive, attr="
+                          << static_cast<int>(attr);
+  return std::max<uint32_t>(
+      1, static_cast<uint32_t>(std::floor(core_count * ratio)));
+}
+
+void configure_onerec_stream_resource_limit(int32_t device_id,
+                                            aclrtStream stream) {
+  const double ratio =
+      RecConfig::get_instance().onerec_multistream_core_ratio();
+  CHECK(std::isfinite(ratio) && ratio > 0.0 && ratio <= 1.0)
+      << "--onerec_multistream_core_ratio must be in (0, 1], got " << ratio;
+  const uint32_t cube_core_limit =
+      get_device_core_limit(device_id, ACL_DEV_ATTR_CUBE_CORE_NUM, ratio);
+  const uint32_t vector_core_limit =
+      get_device_core_limit(device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM, ratio);
+
+  CHECK_EQ(
+      aclrtSetStreamResLimit(stream, ACL_RT_DEV_RES_CUBE_CORE, cube_core_limit),
+      ACL_SUCCESS)
+      << "Failed to set OneRec stream Cube Core limit";
+  CHECK_EQ(aclrtSetStreamResLimit(
+               stream, ACL_RT_DEV_RES_VECTOR_CORE, vector_core_limit),
+           ACL_SUCCESS)
+      << "Failed to set OneRec stream Vector Core limit";
+  LOG(INFO) << "Configured OneRec stream core limits, ratio=" << ratio
+            << ", cube_cores=" << cube_core_limit
+            << ", vector_cores=" << vector_core_limit;
+}
+
+void use_onerec_stream_resource_limit(aclrtStream stream) {
+  CHECK_EQ(aclrtUseStreamResInCurrentThread(stream), ACL_SUCCESS)
+      << "Failed to use OneRec stream resource limit in current thread";
+}
+#else
+bool should_serialize_onerec_xattention_prepare(int64_t max_concurrency) {
+  UNUSED_PARAMETER(max_concurrency);
+  return false;
+}
+
+bool should_serialize_onerec_xattention_model_forward(int64_t max_concurrency) {
+  UNUSED_PARAMETER(max_concurrency);
+  return false;
+}
+#endif
 
 #if defined(USE_NPU)
 torch::Tensor int32_vector_to_device_tensor(const std::vector<int32_t>& values,
@@ -125,13 +337,15 @@ struct OneRecBeamSearchTensors {
   torch::Tensor out_token_index;
   torch::Tensor out_beam_count_prefix_sums;
   torch::Tensor out_seqgroup;
+  torch::Tensor token_step_logprobs;
 };
 
 OneRecBeamSearchTensors prepare_onerec_beam_search_tensors(
     int32_t batch_size,
     int32_t beam_width,
     int32_t total_rounds,
-    const torch::Device& device) {
+    const torch::Device& device,
+    const torch::Tensor& out_token_ids) {
   const torch::TensorOptions int_options =
       torch::TensorOptions().dtype(torch::kInt32).device(device);
   const torch::TensorOptions fp32_options =
@@ -143,10 +357,18 @@ OneRecBeamSearchTensors prepare_onerec_beam_search_tensors(
       torch::zeros({batch_size, beam_width, total_rounds}, int_options);
   tensors.acc_logprob = torch::zeros({num_seq, 1}, fp32_options);
   tensors.out_log_probs = torch::zeros({num_seq, 1}, fp32_options);
-  tensors.out_token_ids = torch::zeros({num_seq, 1}, int_options);
+  CHECK(out_token_ids.defined());
+  CHECK_EQ(out_token_ids.dim(), 2);
+  CHECK_EQ(out_token_ids.size(0), num_seq);
+  CHECK_EQ(out_token_ids.size(1), 1);
+  CHECK_EQ(out_token_ids.scalar_type(), torch::kInt32);
+  CHECK_EQ(out_token_ids.device(), device);
+  tensors.out_token_ids = out_token_ids;
   tensors.out_token_index = torch::zeros({num_seq, 1}, int_options);
   tensors.out_beam_count_prefix_sums = torch::zeros({num_seq, 1}, int_options);
   tensors.out_seqgroup = torch::zeros_like(tensors.sequence_group);
+  tensors.token_step_logprobs =
+      torch::zeros({batch_size, beam_width, total_rounds}, fp32_options);
   return tensors;
 }
 
@@ -876,17 +1098,16 @@ RecWorkerImpl::OneRecXAttentionWorkPipeline::OneRecXAttentionWorkPipeline(
     : RecWorkPipeline(runtime),
       rec_sampler_(std::make_unique<RecSampler>(
           RecPipelineType::kOneRecXAttentionPipeline)),
-      filter_mask_threadpool_(std::make_unique<ThreadPool>(
-          /*num_threads=*/1,
-          /*cpu_binding=*/false,
-          /*pool_name=*/"OneRecXAttentionWorkPipeline.filter_mask")) {
+      filter_mask_threadpool_(std::make_unique<ThreadPool>(1)) {
   max_seqs_per_batch_ = runtime_.worker.options_.max_seqs_per_batch();
+  max_tokens_per_batch_ = runtime_.worker.options_.max_tokens_per_batch();
   beam_width_ = std::max<int32_t>(1, runtime_.worker.options_.beam_width());
   max_decode_step_ =
       std::max<int32_t>(0, get_rec_multi_round_decode_rounds() - 1);
+  allocate_shared_kv_caches();
   allocate_unshared_kv_caches();
 
-  if (!::xllm::RecConfig::get_instance().enable_constrained_decoding()) {
+  if (!RecConfig::get_instance().enable_constrained_decoding()) {
     return;
   }
   auto* vocab_dict = get_onerec_vocab_dict(runtime_.worker.model_weights_path_);
@@ -955,7 +1176,8 @@ bool RecWorkerImpl::OneRecXAttentionWorkPipeline::can_use_device_constraints(
     int32_t current_step,
     int32_t beam_width) const {
 #if defined(USE_NPU)
-  return ::xllm::RecConfig::get_instance().enable_constrained_decoding() &&
+  return !is_onerec_single_step_mode() &&
+         RecConfig::get_instance().enable_constrained_decoding() &&
          constraint_device_tensors_.initialized && current_step >= 0 &&
          current_step < REC_TOKEN_SIZE && beam_width > 0 &&
          sampling_params.selected_token_idxes.defined() &&
@@ -1053,6 +1275,69 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::
                       static_cast<int64_t>(max_decode_step_),
                       head_dim},
                      cache_options);
+  }
+}
+
+void RecWorkerImpl::OneRecXAttentionWorkPipeline::allocate_shared_kv_caches() {
+  if (max_tokens_per_batch_ <= 0) {
+    return;
+  }
+
+  const auto& args = runtime_.context->get_model_args();
+  const auto& parallel_args = runtime_.context->get_parallel_args();
+  const int32_t num_layers = static_cast<int32_t>(args.n_layers());
+  const int64_t decoder_kv_heads = args.decoder_n_kv_heads().value_or(
+      args.n_kv_heads().value_or(args.decoder_n_heads()));
+  const int64_t local_kv_heads =
+      decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
+  const int64_t head_dim = args.decoder_head_dim();
+  auto cache_options = torch::TensorOptions()
+                           .dtype(runtime_.worker.dtype())
+                           .device(runtime_.worker.device());
+
+  cached_shared_k_caches_.resize(num_layers);
+  cached_shared_v_caches_.resize(num_layers);
+  for (int32_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+    cached_shared_k_caches_[layer_id] =
+        torch::zeros({static_cast<int64_t>(max_tokens_per_batch_),
+                      std::max<int64_t>(local_kv_heads, 1),
+                      std::max<int64_t>(head_dim, 1)},
+                     cache_options);
+    cached_shared_v_caches_[layer_id] =
+        torch::zeros({static_cast<int64_t>(max_tokens_per_batch_),
+                      std::max<int64_t>(local_kv_heads, 1),
+                      std::max<int64_t>(head_dim, 1)},
+                     cache_options);
+  }
+}
+
+void RecWorkerImpl::OneRecXAttentionWorkPipeline::
+    prepare_shared_kv_caches_for_input(int64_t shared_kv_tokens,
+                                       OneRecXAttentionParams& onerec_params) {
+  if (cached_shared_k_caches_.empty() || cached_shared_v_caches_.empty()) {
+    allocate_shared_kv_caches();
+  }
+  CHECK(!cached_shared_k_caches_.empty() && !cached_shared_v_caches_.empty())
+      << "OneRec xattention shared kv cache is not initialized.";
+  CHECK_LE(shared_kv_tokens, static_cast<int64_t>(max_tokens_per_batch_))
+      << "OneRec xattention shared kv tokens exceed max_tokens_per_batch, "
+      << "shared_kv_tokens=" << shared_kv_tokens
+      << ", max_tokens_per_batch=" << max_tokens_per_batch_;
+
+  onerec_params.shared_k_caches.clear();
+  onerec_params.shared_v_caches.clear();
+  onerec_params.shared_k_caches.reserve(cached_shared_k_caches_.size());
+  onerec_params.shared_v_caches.reserve(cached_shared_v_caches_.size());
+  for (size_t layer_id = 0; layer_id < cached_shared_k_caches_.size();
+       ++layer_id) {
+    auto shared_k =
+        cached_shared_k_caches_[layer_id].slice(0, 0, shared_kv_tokens);
+    auto shared_v =
+        cached_shared_v_caches_[layer_id].slice(0, 0, shared_kv_tokens);
+    shared_k.zero_();
+    shared_v.zero_();
+    onerec_params.shared_k_caches.emplace_back(std::move(shared_k));
+    onerec_params.shared_v_caches.emplace_back(std::move(shared_v));
   }
 }
 
@@ -1175,6 +1460,21 @@ ForwardInput RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_inputs(
 void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
     const ForwardInput& inputs,
     ForwardInput& processed_inputs) {
+  const bool trace_lock_timing = enable_onerec_xattention_lock_timing();
+  std::unique_lock<std::mutex> prepare_lock(
+      runtime_.worker.onerec_xattention_prepare_mutex_, std::defer_lock);
+  const bool need_prepare_lock = should_serialize_onerec_xattention_prepare(
+      runtime_.worker.options_.rec_worker_max_concurrency());
+  if (need_prepare_lock) {
+    Timer lock_wait_timer;
+    prepare_lock.lock();
+    if (trace_lock_timing) {
+      LOG(INFO) << "OneRec xattention host timing, stage=prepare_lock_wait"
+                << ", elapsed_us=" << lock_wait_timer.elapsed_microseconds();
+    }
+  }
+  Timer prepare_host_timer;
+
   const bool trace_stage_timing = enable_onerec_xattention_stage_timing();
   Timer prepare_timer;
   auto log_prepare_timing = [&](const char* stage_name) {
@@ -1219,13 +1519,6 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
 
   auto& onerec_params =
       processed_inputs.input_params.mutable_onerec_xattention_params();
-  const auto& args = runtime_.context->get_model_args();
-  const auto& parallel_args = runtime_.context->get_parallel_args();
-  const int64_t decoder_kv_heads = args.decoder_n_kv_heads().value_or(
-      args.n_kv_heads().value_or(args.decoder_n_heads()));
-  const int64_t local_kv_heads =
-      decoder_kv_heads / std::max<int64_t>(parallel_args.world_size(), 1);
-  const int64_t head_dim = args.decoder_head_dim();
   const int64_t batch_size = std::max<int64_t>(
       onerec_params.bs > 0 ? onerec_params.bs
                            : inputs.input_params.meta.num_sequences,
@@ -1244,27 +1537,7 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
         batch_size *
         std::max<int64_t>(processed_inputs.input_params.meta.q_max_seq_len, 1);
   }
-  const int32_t decoder_layers = static_cast<int32_t>(args.n_layers());
-  auto fp_options = torch::TensorOptions()
-                        .dtype(runtime_.worker.dtype())
-                        .device(runtime_.worker.device());
-
-  onerec_params.shared_k_caches.clear();
-  onerec_params.shared_v_caches.clear();
-  onerec_params.shared_k_caches.reserve(decoder_layers);
-  onerec_params.shared_v_caches.reserve(decoder_layers);
-  for (int32_t layer_id = 0; layer_id < decoder_layers; ++layer_id) {
-    onerec_params.shared_k_caches.emplace_back(
-        torch::zeros({shared_kv_tokens,
-                      std::max<int64_t>(local_kv_heads, 1),
-                      std::max<int64_t>(head_dim, 1)},
-                     fp_options));
-    onerec_params.shared_v_caches.emplace_back(
-        torch::zeros({shared_kv_tokens,
-                      std::max<int64_t>(local_kv_heads, 1),
-                      std::max<int64_t>(head_dim, 1)},
-                     fp_options));
-  }
+  prepare_shared_kv_caches_for_input(shared_kv_tokens, onerec_params);
   prepare_unshared_kv_caches_for_input(inputs, onerec_params);
   processed_inputs.input_params.attention.device.block_tables =
       torch::arange(batch_size,
@@ -1272,7 +1545,6 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
                         .dtype(torch::kInt32)
                         .device(runtime_.worker.device()));
   log_prepare_timing("cache_prepare");
-
   const int32_t beam_width =
       inputs.step_meta() != nullptr
           ? std::max<int32_t>(1, inputs.step_meta()->beam_width)
@@ -1280,9 +1552,18 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   const auto int_options = torch::TensorOptions()
                                .dtype(torch::kInt32)
                                .device(runtime_.worker.device());
-  onerec_params.beam_width_tensor = torch::tensor({beam_width}, int_options);
-  onerec_params.current_round_tensor =
-      torch::tensor({get_onerec_decode_round(onerec_params)}, int_options);
+  if (!beam_width_tensor_.defined()) {
+    beam_width_tensor_ = torch::empty({1}, int_options);
+  }
+  if (!current_round_tensor_.defined()) {
+    current_round_tensor_ = torch::empty({1}, int_options);
+  }
+  // Beam width is request-static. Current round reuses its scalar address and
+  // only updates the value inside the device loop.
+  beam_width_tensor_.fill_(beam_width);
+  current_round_tensor_.fill_(get_onerec_decode_round(onerec_params));
+  onerec_params.beam_width_tensor = beam_width_tensor_;
+  onerec_params.current_round_tensor = current_round_tensor_;
   if (enable_onerec_selected_token_cpu_check() &&
       processed_inputs.sampling_params.selected_token_idxes.defined()) {
     onerec_params.debug_selected_token_idxes =
@@ -1312,6 +1593,10 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
   onerec_params.decoder_context_embedding =
       onerec_params.decoder_context_embedding.to(runtime_.worker.dtype());
   log_prepare_timing("metadata_prepare");
+  if (trace_lock_timing && need_prepare_lock) {
+    LOG(INFO) << "OneRec xattention host timing, stage=prepare_lock_hold"
+              << ", elapsed_us=" << prepare_host_timer.elapsed_microseconds();
+  }
 }
 
 folly::SemiFuture<torch::Tensor>
@@ -1402,7 +1687,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     const bool use_device_constraints = can_use_device_constraints(
         sampling_params, current_step, request_beam_width);
 #if defined(USE_NPU)
-    if (::xllm::RecConfig::get_instance().enable_constrained_decoding() &&
+    if (RecConfig::get_instance().enable_constrained_decoding() &&
         sampling_params.selected_token_idxes.defined() &&
         !use_device_constraints) {
       LOG_FIRST_N(WARNING, 8)
@@ -1440,12 +1725,15 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
 
     std::optional<folly::SemiFuture<torch::Tensor>> filter_mask_future;
     if ((runtime_.worker.driver_ || runtime_.worker.dp_driver_) &&
-        ::xllm::RecConfig::get_instance().enable_constrained_decoding() &&
+        RecConfig::get_instance().enable_constrained_decoding() &&
         constrained_decoding_ != nullptr &&
         sampling_params.selected_token_idxes.defined() &&
         !use_device_constraints) {
-      filter_mask_future =
-          prepare_filter_mask_async(round_params->generated_tokens);
+      const auto prefixes = sequence_group.defined()
+                                ? runtime::detail::beam_constraint_prefixes(
+                                      sequence_group, current_step)
+                                : round_params->generated_tokens;
+      filter_mask_future = prepare_filter_mask_async(prefixes);
     }
 
     torch::Tensor selected_token_idxes_for_logits;
@@ -1495,6 +1783,40 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     };
 #endif
 
+    auto forward_model = [&](const torch::Tensor& tokens,
+                             const torch::Tensor& positions,
+                             const ModelInputParams& params) {
+      const bool trace_lock_timing = enable_onerec_xattention_lock_timing();
+      std::unique_lock<std::mutex> forward_lock(
+          runtime_.worker.onerec_xattention_model_forward_mutex_,
+          std::defer_lock);
+      const bool need_forward_lock =
+          should_serialize_onerec_xattention_model_forward(
+              runtime_.worker.options_.rec_worker_max_concurrency());
+      if (need_forward_lock) {
+        Timer lock_wait_timer;
+        forward_lock.lock();
+        if (trace_lock_timing) {
+          LOG(INFO)
+              << "OneRec xattention host timing, stage=model_forward_lock_wait"
+              << ", elapsed_us=" << lock_wait_timer.elapsed_microseconds();
+        }
+      }
+      Timer forward_host_timer;
+      Timer forward_lock_hold_timer;
+      auto output = runtime_.executor->forward(
+          tokens, positions, runtime_.worker.kv_caches_, params);
+      log_onerec_xattention_host_stage_timing(
+          "model_forward", stage_round, forward_host_timer);
+      if (trace_lock_timing && need_forward_lock) {
+        LOG(INFO)
+            << "OneRec xattention host timing, stage=model_forward_lock_hold"
+            << ", elapsed_us="
+            << forward_lock_hold_timer.elapsed_microseconds();
+      }
+      return output;
+    };
+
     torch::Tensor hidden_states;
     if (round_params->rec_stage == OneRecModelInputParams::RecStage::PREFILL) {
       if (!round_params->is_first_prefill) {
@@ -1508,11 +1830,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         decoder_onerec_params.is_encoder_forward = false;
         decoder_onerec_params.has_encoder_output =
             round_params->has_encoder_output;
-        auto model_output =
-            runtime_.executor->forward(mutable_input.token_ids,
-                                       mutable_input.positions,
-                                       runtime_.worker.kv_caches_,
-                                       decoder_params);
+        auto model_output = forward_model(
+            mutable_input.token_ids, mutable_input.positions, decoder_params);
 #if defined(USE_NPU)
         validate_selected_token_idxes_stage("decoder_forward");
 #endif
@@ -1544,11 +1863,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
           encoder_tokens = round_params->encoder_token_ids;
         }
 
-        auto encoder_output =
-            runtime_.executor->forward(encoder_tokens,
-                                       round_params->encoder_positions,
-                                       runtime_.worker.kv_caches_,
-                                       encoder_params);
+        auto encoder_output = forward_model(
+            encoder_tokens, round_params->encoder_positions, encoder_params);
 #if defined(USE_NPU)
         validate_selected_token_idxes_stage("encoder_forward");
 #endif
@@ -1559,11 +1875,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         decoder_onerec_params.is_encoder_forward = false;
         decoder_onerec_params.has_encoder_output =
             encoder_output.hidden_states.defined();
-        auto model_output =
-            runtime_.executor->forward(mutable_input.token_ids,
-                                       mutable_input.positions,
-                                       runtime_.worker.kv_caches_,
-                                       decoder_params);
+        auto model_output = forward_model(
+            mutable_input.token_ids, mutable_input.positions, decoder_params);
 #if defined(USE_NPU)
         validate_selected_token_idxes_stage("decoder_forward");
 #endif
@@ -1580,10 +1893,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
       decoder_onerec_params.is_encoder_forward = false;
       decoder_onerec_params.has_encoder_output =
           round_params->has_encoder_output;
-      auto model_output = runtime_.executor->forward(mutable_input.token_ids,
-                                                     mutable_input.positions,
-                                                     runtime_.worker.kv_caches_,
-                                                     decoder_params);
+      auto model_output = forward_model(
+          mutable_input.token_ids, mutable_input.positions, decoder_params);
 #if defined(USE_NPU)
       validate_selected_token_idxes_stage("decode_forward");
 #endif
@@ -1646,12 +1957,22 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         }
       }
 #endif
-      result.logits =
-          runtime_.model->logits(hidden_states, selected_token_idxes);
+      Timer logits_host_timer;
+      result.logits = runtime_.model->logits(
+          hidden_states, selected_token_idxes, current_step);
+      log_onerec_xattention_host_stage_timing(
+          "logits", stage_round, logits_host_timer);
       log_stage_timing("logits", stage_round, stage_timer);
       torch::Tensor filter_mask;
       if (filter_mask_future.has_value()) {
         filter_mask = std::move(filter_mask_future.value()).get();
+      }
+      // The first split head starts at token zero. Its probability output
+      // needs only the matching prefix of the full vocabulary mask.
+      if (is_onerec_single_step_mode() && filter_mask.defined() &&
+          filter_mask.size(1) != result.logits.size(1)) {
+        CHECK_GE(filter_mask.size(1), result.logits.size(1));
+        filter_mask = filter_mask.slice(1, 0, result.logits.size(1));
       }
       RecSamplingContext sampling_context;
       sampling_context.sequence_group = sequence_group;
@@ -1671,77 +1992,122 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
               logits, params, sequence_group, current_step);
         };
       }
+      Timer sampler_host_timer;
       result.sample_output = rec_sampler_->forward(
           result.logits, sampling_params, filter_mask, &sampling_context);
+      log_onerec_xattention_host_stage_timing(
+          "sampler", stage_round, sampler_host_timer);
       log_stage_timing("sampler", stage_round, stage_timer);
     }
     return result;
   };
 
-  auto prepare_decode_round_input =
-      [&](int32_t round,
-          int32_t batch_size,
-          int32_t beam_width,
-          const std::vector<int32_t>& decode_positions_vec,
-          const torch::Tensor& sequence_group) {
-        auto& round_params =
-            mutable_input.input_params.mutable_onerec_xattention_params();
-        const int32_t decode_step = std::max(round - 1, 0);
+  auto prepare_decode_round_input = [&](int32_t round,
+                                        int32_t batch_size,
+                                        int32_t beam_width,
+                                        const torch::Tensor& next_token_ids) {
+    auto& round_params =
+        mutable_input.input_params.mutable_onerec_xattention_params();
 
-        round_params.rec_stage = OneRecModelInputParams::RecStage::DECODE;
-        round_params.is_first_prefill = false;
-        round_params.is_encoder_forward = false;
-        if (round_params.current_round_tensor.defined()) {
-          round_params.current_round_tensor.fill_(round);
-        }
-        if (round_params.beam_width_tensor.defined()) {
-          round_params.beam_width_tensor.fill_(beam_width);
-        }
+    round_params.rec_stage = OneRecModelInputParams::RecStage::DECODE;
+    round_params.is_first_prefill = false;
+    round_params.is_encoder_forward = false;
+#if defined(USE_NPU)
+    if (round == 1 && ExecutionConfig::get_instance().enable_graph()) {
+      round_params.cross_attn_new_cache_slots = torch::Tensor();
+      CHECK_GT(KVCacheConfig::get_instance().block_size(), 0);
+      const int64_t max_encoder_kv_len =
+          runtime_.context->get_model_args().max_position_embeddings();
+      CHECK_GT(max_encoder_kv_len, 0);
+      CHECK_LE(round_params.encoder_max_seq_len, max_encoder_kv_len);
+      const int64_t decode_block_table_len =
+          (max_encoder_kv_len + KVCacheConfig::get_instance().block_size() -
+           1) /
+          KVCacheConfig::get_instance().block_size();
+      const int64_t required_blocks =
+          (static_cast<int64_t>(round_params.encoder_max_seq_len) +
+           KVCacheConfig::get_instance().block_size() - 1) /
+          KVCacheConfig::get_instance().block_size();
 
-        if (sequence_group.defined()) {
-          mutable_input.token_ids =
-              sequence_group.select(/*dim=*/2, /*index=*/decode_step)
-                  .contiguous()
-                  .reshape({-1});
-        }
+      auto& cross_block_tables = round_params.cross_attn_block_tables;
+      CHECK(cross_block_tables.defined());
+      CHECK_EQ(cross_block_tables.dim(), 2);
+      CHECK_EQ(cross_block_tables.size(0), batch_size);
+      CHECK_GE(cross_block_tables.size(1), required_blocks);
+      if (cross_block_tables.size(1) < decode_block_table_len) {
+        auto padding =
+            torch::zeros({cross_block_tables.size(0),
+                          decode_block_table_len - cross_block_tables.size(1)},
+                         cross_block_tables.options());
+        cross_block_tables =
+            torch::cat({cross_block_tables, padding}, /*dim=*/1);
+      } else if (cross_block_tables.size(1) > decode_block_table_len) {
+        cross_block_tables =
+            cross_block_tables
+                .slice(/*dim=*/1, /*start=*/0, /*end=*/decode_block_table_len)
+                .contiguous();
+      }
+    }
+#endif
+    if (round_params.current_round_tensor.defined()) {
+      round_params.current_round_tensor.fill_(round);
+    }
 
-        round_params.decoder_context_embedding = torch::Tensor();
-        round_params.bs = batch_size;
-        round_params.group_width = beam_width;
-        round_params.seq_len = 1;
+    if (next_token_ids.defined()) {
+      CHECK_EQ(next_token_ids.numel(),
+               static_cast<int64_t>(batch_size) * beam_width);
+      // Beam search already materializes selected tokens contiguously.
+      mutable_input.token_ids = next_token_ids.reshape({-1});
+    }
 
-        std::vector<int32_t> positions_host;
-        positions_host.reserve(static_cast<size_t>(batch_size * beam_width));
-        std::vector<int32_t> selected_token_idxes;
-        selected_token_idxes.reserve(
-            static_cast<size_t>(batch_size * beam_width));
-        for (int32_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
-          for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
-            positions_host.emplace_back(
-                decode_positions_vec.at(static_cast<size_t>(seq_idx)) +
-                decode_step);
-            selected_token_idxes.emplace_back(seq_idx * beam_width + beam_idx);
-          }
+    round_params.decoder_context_embedding = torch::Tensor();
+    round_params.bs = batch_size;
+    round_params.group_width = beam_width;
+    round_params.seq_len = 1;
+
+    auto int_options = torch::TensorOptions()
+                           .dtype(torch::kInt32)
+                           .device(runtime_.worker.device());
+    // OneRec uses internal relative position bias and ignores this argument.
+    mutable_input.positions = torch::Tensor();
+
+    if (enable_onerec_xattention_cache_selected_token_idxes()) {
+      const int64_t total_beam = static_cast<int64_t>(batch_size) * beam_width;
+      if (!cached_decode_selected_token_idxes_.defined() ||
+          cached_decode_selected_token_count_ != total_beam ||
+          cached_decode_selected_token_idxes_.device() !=
+              runtime_.worker.device()) {
+        cached_decode_selected_token_idxes_ =
+            torch::arange(total_beam, int_options);
+        cached_decode_selected_token_count_ = total_beam;
+      }
+      mutable_input.decoder_sampling_params.selected_token_idxes =
+          cached_decode_selected_token_idxes_;
+    } else {
+      std::vector<int32_t> selected_token_idxes;
+      selected_token_idxes.reserve(
+          static_cast<size_t>(batch_size * beam_width));
+      for (int32_t seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+        for (int32_t beam_idx = 0; beam_idx < beam_width; ++beam_idx) {
+          selected_token_idxes.emplace_back(seq_idx * beam_width + beam_idx);
         }
-        auto int_options = torch::TensorOptions()
-                               .dtype(torch::kInt32)
-                               .device(runtime_.worker.device());
-        mutable_input.positions = torch::tensor(positions_host, int_options);
-        mutable_input.decoder_sampling_params.selected_token_idxes =
-            torch::tensor(selected_token_idxes, int_options);
-        mutable_input.decoder_sampling_params.num_return_sequences =
-            mutable_input.sampling_params.num_return_sequences;
-        mutable_input.input_params.meta.batch_forward_type =
-            BatchForwardType::DECODE;
-        mutable_input.input_params.meta.num_sequences = batch_size * beam_width;
-        mutable_input.input_params.embedding.input_embedding = torch::Tensor();
-        mutable_input.input_params.attn_metadata = nullptr;
-      };
+      }
+      mutable_input.decoder_sampling_params.selected_token_idxes =
+          torch::tensor(selected_token_idxes, int_options);
+    }
+    mutable_input.decoder_sampling_params.num_return_sequences =
+        mutable_input.sampling_params.num_return_sequences;
+    mutable_input.input_params.meta.batch_forward_type =
+        BatchForwardType::DECODE;
+    mutable_input.input_params.meta.num_sequences = batch_size * beam_width;
+    mutable_input.input_params.embedding.input_embedding = torch::Tensor();
+    mutable_input.input_params.attn_metadata = nullptr;
+  };
 
   auto step_meta = mutable_input.step_meta();
   const bool use_multi_round =
       step_meta != nullptr && step_meta->total_round > 1 &&
-      step_meta->beam_width > 1 &&
+      step_meta->beam_width > 0 &&
       mutable_input.decoder_sampling_params.selected_token_idxes.defined();
 
   if (!use_multi_round) {
@@ -1759,7 +2125,9 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
 
     if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
         !runtime_.worker.options_.enable_speculative_decode()) {
-      runtime_.stream->synchronize();
+      synchronize_onerec_xattention_stream(*runtime_.stream,
+                                           "single_round_non_driver",
+                                           /*round=*/0);
       COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
       DeviceMonitor::get_instance().update_active_activation_memory(
           runtime_.worker.device_.index());
@@ -1773,7 +2141,9 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     output.logprobs = result->sampling_params.logprobs;
     output.max_top_logprobs = result->sampling_params.max_top_logprobs;
 
-    runtime_.stream->synchronize();
+    synchronize_onerec_xattention_stream(*runtime_.stream,
+                                         "single_round_final",
+                                         /*round=*/0);
     COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
     DeviceMonitor::get_instance().update_active_activation_memory(
         runtime_.worker.device_.index());
@@ -1783,8 +2153,24 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
   const int32_t batch_size = step_meta->batch_size;
   const int32_t beam_width = step_meta->beam_width;
   const int32_t total_rounds = step_meta->total_round;
-  OneRecBeamSearchTensors beam_tensors = prepare_onerec_beam_search_tensors(
-      batch_size, beam_width, total_rounds, runtime_.worker.device());
+  const int64_t num_seq = static_cast<int64_t>(batch_size) * beam_width;
+  CHECK_GT(num_seq, 0);
+  // A buffer for each token count keeps graph input addresses stable when
+  // requests with different batch/beam shapes alternate on this pipeline.
+  auto& cached_decode_token_ids = cached_decode_token_ids_[num_seq];
+  if (!cached_decode_token_ids.defined()) {
+    cached_decode_token_ids =
+        torch::empty({num_seq, 1},
+                     torch::TensorOptions()
+                         .dtype(torch::kInt32)
+                         .device(runtime_.worker.device()));
+  }
+  OneRecBeamSearchTensors beam_tensors =
+      prepare_onerec_beam_search_tensors(batch_size,
+                                         beam_width,
+                                         total_rounds,
+                                         runtime_.worker.device(),
+                                         cached_decode_token_ids);
 
   ForwardOutput output;
   torch::Tensor top_tokens;
@@ -1793,11 +2179,11 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
   for (int32_t round = 0; round < total_rounds; ++round) {
     if (round > 0) {
       Timer prepare_round_timer;
-      prepare_decode_round_input(round,
-                                 batch_size,
-                                 beam_width,
-                                 step_meta->decode_positions_vec,
-                                 beam_tensors.sequence_group);
+      Timer prepare_round_host_timer;
+      prepare_decode_round_input(
+          round, batch_size, beam_width, beam_tensors.out_token_ids);
+      log_onerec_xattention_host_stage_timing(
+          "prepare_decode_round_input", round, prepare_round_host_timer);
       log_stage_timing(
           "prepare_decode_round_input", round, prepare_round_timer);
     }
@@ -1806,6 +2192,17 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
                                       ? mutable_input.sampling_params
                                       : mutable_input.decoder_sampling_params;
     SamplingParameters round_sampling_params = sampling_params;
+    // Width one still executes every decode round. Internal beam selection
+    // needs top candidates even when the caller did not request logprobs.
+    round_sampling_params.logprobs = true;
+    round_sampling_params.use_beam_search = true;
+    round_sampling_params.max_top_logprobs =
+        std::max<int64_t>(round_sampling_params.max_top_logprobs, beam_width);
+    if (round == 0) {
+      // First-round selection creates exactly BW parents. Later rounds can
+      // expand each parent with a different number of candidate tokens.
+      round_sampling_params.max_top_logprobs = beam_width;
+    }
     const int32_t requested_result_width =
         get_requested_beam_result_width(round_sampling_params, beam_width);
     const bool final_round = round == total_rounds - 1;
@@ -1838,35 +2235,74 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
                         ? result->sample_output.top_logprobs.sizes()
                         : c10::IntArrayRef{});
     }
-    if (!result->sample_output.top_tokens.defined() ||
-        !result->sample_output.top_logprobs.defined()) {
-      output.do_sample = result->sampling_params.do_sample;
-      output.logprobs = result->sampling_params.logprobs;
-      output.max_top_logprobs = result->sampling_params.max_top_logprobs;
-      continue;
+    CHECK(result->sample_output.top_tokens.defined());
+    CHECK(result->sample_output.top_logprobs.defined());
+
+    torch::Tensor final_round_token_ids;
+    if (final_round && requested_result_width == beam_width) {
+      // Returned tensors must not alias pipeline storage that the next request
+      // can reuse while asynchronous output handling is still in flight.
+      final_round_token_ids = torch::empty_like(beam_tensors.out_token_ids);
     }
+    torch::Tensor& round_out_token_ids = final_round_token_ids.defined()
+                                             ? final_round_token_ids
+                                             : beam_tensors.out_token_ids;
 
 #if defined(USE_NPU)
     Timer beam_timer;
+    Timer beam_host_timer;
     if (round == 0) {
       top_tokens =
           result->sample_output.top_tokens.to(torch::kInt32).reshape({-1, 1});
       top_logprobs = result->sample_output.top_logprobs.reshape({-1, 1});
-      beam_tensors.out_token_ids.copy_(top_tokens);
-      beam_tensors.out_log_probs.copy_(top_logprobs);
-      beam_tensors.out_seqgroup.select(/*dim=*/2, /*index=*/0)
-          .copy_(top_tokens.reshape({-1}));
+      runtime::detail::write_first_round_beam_outputs(
+          top_tokens,
+          top_logprobs,
+          batch_size,
+          beam_tensors.out_token_ids,
+          beam_tensors.out_log_probs,
+          beam_tensors.out_seqgroup);
     } else if (final_round && requested_result_width != beam_width) {
       top_tokens = result->sample_output.top_tokens.to(torch::kInt32);
       top_logprobs = result->sample_output.top_logprobs;
-      fill_final_onerec_beam_outputs(top_tokens,
-                                     top_logprobs,
-                                     beam_tensors,
-                                     round,
-                                     batch_size,
-                                     beam_width,
-                                     requested_result_width,
-                                     runtime_.worker.device());
+      OneRecBeamSearchOutputTensors final_tensors =
+          prepare_onerec_beam_search_output_tensors(batch_size,
+                                                    requested_result_width,
+                                                    total_rounds,
+                                                    runtime_.worker.device());
+      if (can_use_beam_search_rec_final_select(
+              batch_size, top_tokens, requested_result_width)) {
+        xllm::kernel::npu::beam_search_rec(
+            /*logprobs=*/beam_tensors.acc_logprob,
+            /*top_tokens=*/top_tokens,
+            /*top_logprobs=*/top_logprobs,
+            /*sequence_group=*/beam_tensors.sequence_group,
+            /*current_step=*/static_cast<int64_t>(round),
+            /*result_width=*/requested_result_width,
+            /*out_token_ids=*/final_tensors.out_token_ids,
+            /*out_token_index=*/final_tensors.out_token_index,
+            /*out_log_probs=*/final_tensors.out_log_probs,
+            /*out_beam_count_prefix_sums=*/
+            final_tensors.out_beam_count_prefix_sums,
+            /*out_sequence=*/final_tensors.out_seqgroup);
+      } else {
+        select_final_onerec_beam_results(beam_tensors.acc_logprob,
+                                         beam_tensors.sequence_group,
+                                         top_tokens,
+                                         top_logprobs,
+                                         batch_size,
+                                         beam_width,
+                                         requested_result_width,
+                                         total_rounds,
+                                         round,
+                                         final_tensors);
+      }
+      beam_tensors.out_token_ids = std::move(final_tensors.out_token_ids);
+      beam_tensors.out_token_index = std::move(final_tensors.out_token_index);
+      beam_tensors.out_beam_count_prefix_sums =
+          std::move(final_tensors.out_beam_count_prefix_sums);
+      beam_tensors.out_log_probs = std::move(final_tensors.out_log_probs);
+      beam_tensors.out_seqgroup = std::move(final_tensors.out_seqgroup);
     } else {
       top_tokens = result->sample_output.top_tokens.to(torch::kInt32);
       top_logprobs = result->sample_output.top_logprobs;
@@ -1876,13 +2312,15 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
           /*top_logprobs=*/top_logprobs,
           /*sequence_group=*/beam_tensors.sequence_group,
           /*current_step=*/static_cast<int64_t>(round),
-          /*out_token_ids=*/beam_tensors.out_token_ids,
+          /*out_token_ids=*/round_out_token_ids,
           /*out_token_index=*/beam_tensors.out_token_index,
           /*out_log_probs=*/beam_tensors.out_log_probs,
           /*out_beam_count_prefix_sums=*/
           beam_tensors.out_beam_count_prefix_sums,
           /*out_sequence=*/beam_tensors.out_seqgroup);
     }
+    log_onerec_xattention_host_stage_timing(
+        "beam_search", round, beam_host_timer);
     log_stage_timing("beam_search", round, beam_timer);
 #elif defined(USE_CUDA)
     Timer beam_timer;
@@ -1892,14 +2330,27 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
               .reshape({-1, result->sample_output.top_tokens.size(-1)});
       top_logprobs = result->sample_output.top_logprobs.reshape(
           {-1, result->sample_output.top_logprobs.size(-1)});
-      fill_final_onerec_beam_outputs(top_tokens,
-                                     top_logprobs,
-                                     beam_tensors,
-                                     round,
-                                     batch_size,
-                                     beam_width,
-                                     requested_result_width,
-                                     runtime_.worker.device());
+      OneRecBeamSearchOutputTensors final_tensors =
+          prepare_onerec_beam_search_output_tensors(batch_size,
+                                                    requested_result_width,
+                                                    total_rounds,
+                                                    runtime_.worker.device());
+      select_final_onerec_beam_results(beam_tensors.acc_logprob,
+                                       beam_tensors.sequence_group,
+                                       top_tokens,
+                                       top_logprobs,
+                                       batch_size,
+                                       beam_width,
+                                       requested_result_width,
+                                       total_rounds,
+                                       round,
+                                       final_tensors);
+      beam_tensors.out_token_ids = std::move(final_tensors.out_token_ids);
+      beam_tensors.out_token_index = std::move(final_tensors.out_token_index);
+      beam_tensors.out_beam_count_prefix_sums =
+          std::move(final_tensors.out_beam_count_prefix_sums);
+      beam_tensors.out_log_probs = std::move(final_tensors.out_log_probs);
+      beam_tensors.out_seqgroup = std::move(final_tensors.out_seqgroup);
     } else {
       top_tokens =
           result->sample_output.top_tokens.to(torch::kInt32)
@@ -1911,7 +2362,7 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
                                       top_tokens,
                                       top_logprobs,
                                       beam_tensors.out_log_probs,
-                                      beam_tensors.out_token_ids,
+                                      round_out_token_ids,
                                       beam_tensors.out_token_index,
                                       beam_tensors.out_beam_count_prefix_sums,
                                       beam_tensors.out_seqgroup,
@@ -1923,6 +2374,19 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
 #else
     LOG(FATAL) << "OneRec xattention beam search requires NPU or CUDA.";
 #endif
+    if (final_round_token_ids.defined()) {
+      beam_tensors.out_token_ids = std::move(final_round_token_ids);
+    }
+    if (RecConfig::get_instance().enable_output_sku_logprobs() ||
+        output_logprobs) {
+      runtime::detail::write_beam_round_step_logprobs(
+          beam_tensors.out_log_probs,
+          beam_tensors.acc_logprob,
+          beam_tensors.out_token_index,
+          batch_size,
+          round,
+          beam_tensors.token_step_logprobs);
+    }
     std::swap(beam_tensors.sequence_group, beam_tensors.out_seqgroup);
     std::swap(beam_tensors.acc_logprob, beam_tensors.out_log_probs);
     if (round > 0 && round < total_rounds - 1) {
@@ -1949,10 +2413,22 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
       output.beam_search_output.out_logprobs =
           beam_tensors.acc_logprob.reshape({-1});
       output.beam_sequence_group = beam_tensors.sequence_group;
+      if (RecConfig::get_instance().enable_output_sku_logprobs()) {
+        output.beam_sequence_group_logprobs = beam_tensors.token_step_logprobs;
+      }
     }
   }
 
-  runtime_.stream->synchronize();
+  Timer output_to_cpu_host_timer;
+  move_onerec_xattention_output_to_cpu(output);
+  log_onerec_xattention_host_stage_timing(
+      "output_to_cpu", total_rounds - 1, output_to_cpu_host_timer);
+  if (enable_onerec_xattention_async_output_ready()) {
+    output.ready_event = runtime_.stream->record_event_or_sync();
+  } else {
+    synchronize_onerec_xattention_stream(
+        *runtime_.stream, "final_output_ready", total_rounds - 1);
+  }
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   DeviceMonitor::get_instance().update_active_activation_memory(
       runtime_.worker.device_.index());
@@ -2379,6 +2855,10 @@ RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_beam_search_tensors(
   tensors.out_token_index = torch::zeros({num_seq, 1}, int_options);
   tensors.out_beam_count_prefix_sums = torch::zeros({num_seq, 1}, int_options);
   tensors.out_seqgroup = torch::zeros_like(tensors.sequence_group);
+  if (RecConfig::get_instance().enable_output_sku_logprobs()) {
+    tensors.token_step_logprobs =
+        torch::zeros({batch_size, beam_width, total_rounds}, fp32_options);
+  }
   return tensors;
 }
 
@@ -2394,10 +2874,13 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_beam_search(
   (void)requested_result_width;
   (void)total_rounds;
   if (round == 0) {
-    beam_tensors.out_token_ids.copy_(top_tokens.reshape({-1, 1}));
-    beam_tensors.out_log_probs.copy_(top_logprobs.reshape({-1, 1}));
-    beam_tensors.out_seqgroup.select(/*dim=*/2, /*index=*/0)
-        .copy_(top_tokens.reshape({-1}));
+    runtime::detail::write_first_round_beam_outputs(
+        top_tokens.reshape({-1, 1}),
+        top_logprobs.reshape({-1, 1}),
+        batch_size,
+        beam_tensors.out_token_ids,
+        beam_tensors.out_log_probs,
+        beam_tensors.out_seqgroup);
   } else {
     xllm::kernel::npu::beam_search_rec(
         /*logprobs=*/beam_tensors.acc_logprob,
@@ -2427,6 +2910,13 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_beam_search(
                                   requested_result_width,
                                   round);
 #endif
+  runtime::detail::write_beam_round_step_logprobs(
+      beam_tensors.out_log_probs,
+      beam_tensors.acc_logprob,
+      beam_tensors.out_token_index,
+      batch_size,
+      round,
+      beam_tensors.token_step_logprobs);
   std::swap(beam_tensors.sequence_group, beam_tensors.out_seqgroup);
   std::swap(beam_tensors.acc_logprob, beam_tensors.out_log_probs);
 }
@@ -2448,6 +2938,13 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_final_beam_search(
                                  requested_result_width,
                                  runtime_.worker.device());
 
+  runtime::detail::write_beam_round_step_logprobs(
+      beam_tensors.out_log_probs,
+      beam_tensors.acc_logprob,
+      beam_tensors.out_token_index,
+      batch_size,
+      round,
+      beam_tensors.token_step_logprobs);
   std::swap(beam_tensors.sequence_group, beam_tensors.out_seqgroup);
   std::swap(beam_tensors.acc_logprob, beam_tensors.out_log_probs);
 }
@@ -2520,6 +3017,7 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::build_final_output(
   output.beam_search_output.out_logprobs =
       beam_tensors.acc_logprob.reshape({-1});
   output.beam_sequence_group = beam_tensors.sequence_group;
+  output.beam_sequence_group_logprobs = beam_tensors.token_step_logprobs;
 }
 
 void RecWorkerImpl::LlmRecMultiRoundPipeline::prepare_two_stage_round_input(
@@ -2970,6 +3468,8 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
 }
 
 RecWorkerImpl::~RecWorkerImpl() {
+  // Complete callbacks before destroying the pipeline streams and index queue.
+  step_threadpool_.reset();
   // Release model_, model_executor_, eplb_executor_ in destructor to avoid
   // double deletion. Ownership actually belongs to work_pipelines_[0].
   model_.release();
@@ -3009,7 +3509,7 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
       << "Unsupported rec model_type: " << model_type;
 
   // Create concurrent pipeline (not base class pipeline)
-  auto pipeline_type = get_rec_pipeline_type(rec_model_kind_);
+  pipeline_type_ = get_rec_pipeline_type(rec_model_kind_);
 
   // Reserve space for model instances
   work_pipelines_.reserve(options_.rec_worker_max_concurrency());
@@ -3018,6 +3518,15 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
     auto stream = device_.get_stream_from_pool();
     runtime.stream = std::move(stream);
     auto stream_guard = runtime.stream->set_stream_guard();
+
+#if defined(USE_NPU)
+    if (RecConfig::get_instance().enable_onerec_multistream_core_split() &&
+        rec_model_kind_ == RecModelKind::kOneRec &&
+        options_.rec_worker_max_concurrency() == 2) {
+      configure_onerec_stream_resource_limit(
+          device_.index(), runtime.stream->get_stream()->stream());
+    }
+#endif
 
     runtime.context =
         std::make_unique<ModelContext>(context.get_parallel_args(),
@@ -3043,7 +3552,7 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
           *runtime.model, runtime.worker.device());
     }
 
-    work_pipelines_.emplace_back(create_pipeline(pipeline_type, runtime));
+    work_pipelines_.emplace_back(create_pipeline(pipeline_type_, runtime));
     index_queue_.enqueue(i);
   }
 
@@ -3164,32 +3673,77 @@ folly::SemiFuture<std::optional<ForwardOutput>> RecWorkerImpl::step_async(
     const ForwardInput& input) {
   folly::Promise<std::optional<ForwardOutput>> promise;
 
+  const bool trace_lock_timing =
+      enable_onerec_xattention_lock_timing() &&
+      pipeline_type_ == RecPipelineType::kOneRecXAttentionPipeline;
+  Timer lease_wait_timer;
   size_t index;
   index_queue_.wait_dequeue(index);
+  if (trace_lock_timing) {
+    LOG(INFO) << "OneRec xattention host timing, stage=pipeline_lease_wait"
+              << ", leased_index=" << index
+              << ", elapsed_us=" << lease_wait_timer.elapsed_microseconds();
+  }
   auto future = promise.getSemiFuture();
+  // Copy the input because the scheduled task may run after step_async returns.
+  ForwardInput input_copy = input;
 
   // Use schedule() to assign tasks, letting ThreadPool automatically select
   // idle threads The logic for allocating instance_id happens when the task
   // executes (see lambda below)
   step_threadpool_->schedule_with_tid(
-      [this, &input, index, promise = std::move(promise)]() mutable {
-        auto stream_guard =
-            work_pipelines_[index]->runtime().stream->set_stream_guard();
+      [this,
+       input = std::move(input_copy),
+       index,
+       promise = std::move(promise)]() mutable {
+        xllm::ScopeGuard index_guard([&] { index_queue_.enqueue(index); });
+        try {
+          auto stream_guard =
+              work_pipelines_[index]->runtime().stream->set_stream_guard();
+#if defined(USE_NPU)
+          aclrtStream current_stream =
+              c10_npu::getCurrentNPUStream(device_.index()).stream();
+          if (RecConfig::get_instance()
+                  .enable_onerec_multistream_core_split() &&
+              rec_model_kind_ == RecModelKind::kOneRec &&
+              work_pipelines_.size() == 2) {
+            use_onerec_stream_resource_limit(current_stream);
+          }
+          if (enable_rec_pipeline_concurrency_debug()) {
+            const auto current_npu_stream =
+                c10_npu::getCurrentNPUStream(device_.index());
+            LOG(INFO) << "REC pipeline execute NPU stream, pipeline=" << index
+                      << ", thread_id=" << std::this_thread::get_id()
+                      << ", current_stream_id=" << current_npu_stream.id()
+                      << ", current_stream="
+                      << static_cast<const void*>(current_stream);
+          }
+          atb::Context* atb_context = const_cast<atb::Context*>(
+              work_pipelines_[index]->runtime().context->get_atb_context());
+          CHECK(atb_context != nullptr)
+              << "ATB context is null for REC pipeline " << index;
+          atb_context->SetExecuteStream(current_stream);
+#endif
 
-        ForwardInput input_on_device;
-        work_pipelines_[index]->prepare_work_before_execute(input,
-                                                            input_on_device);
+          ForwardInput input_on_device;
+          work_pipelines_[index]->prepare_work_before_execute(input,
+                                                              input_on_device);
 
-        // hierarchy temporarily disabled during the block-manager refactor
-        // if (hierarchy_kv_cache_transfer_ != nullptr) {
-        //   hierarchy_kv_cache_transfer_->set_layer_synchronizer(
-        //       input_on_device.input_params);
-        // }
-
-        const auto output = work_pipelines_[index]->step(input_on_device);
-        promise.setValue(output);
-
-        index_queue_.enqueue(index);
+          const auto output = work_pipelines_[index]->step(input_on_device);
+          promise.setValue(output);
+        } catch (const std::exception& e) {
+          CHECK_EQ(work_pipelines_[index]->runtime().stream->synchronize(), 0);
+          LOG(ERROR) << "RecWorkerImpl::step_async failed on pipeline " << index
+                     << ": " << e.what();
+          promise.setException(
+              folly::exception_wrapper(std::current_exception()));
+        } catch (...) {
+          CHECK_EQ(work_pipelines_[index]->runtime().stream->synchronize(), 0);
+          LOG(ERROR) << "RecWorkerImpl::step_async failed on pipeline " << index
+                     << ": unknown exception";
+          promise.setException(
+              folly::exception_wrapper(std::current_exception()));
+        }
       },
       index);
 

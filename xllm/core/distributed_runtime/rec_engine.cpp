@@ -65,6 +65,17 @@ RecEngine::RecEngine(const runtime::Options& options,
   }
 }
 
+OneRecBatchInputBuilderCache* RecEngine::input_builder_cache() {
+  // Each engine owns its caches; concurrent scheduler threads never share
+  // mutable builder scratch space. Threads are bounded by the scheduler pool.
+  std::lock_guard<std::mutex> lock(input_cache_mutex_);
+  auto& cache = input_caches_[std::this_thread::get_id()];
+  if (!cache) {
+    cache = std::make_unique<OneRecBatchInputBuilderCache>();
+  }
+  return cache.get();
+}
+
 bool RecEngine::init() {
   if (!init_model()) {
     LOG(ERROR) << "Failed to init model from: " << options_.model_path();
@@ -96,6 +107,15 @@ bool RecEngine::init_model() {
   CHECK(rec_model_kind_ != RecModelKind::kNone)
       << "Unsupported rec model_type: " << args_.model_type();
   auto pipeline_type = get_rec_pipeline_type(rec_model_kind_);
+#if defined(USE_NPU)
+  if (pipeline_type == RecPipelineType::kOneRecXAttentionPipeline &&
+      (args_.decoder_head_dim() != 128 || options_.block_size() != 128)) {
+    LOG(ERROR) << "OneRec CrossAttention requires decoder_head_dim=128 and "
+                  "block_size=128; got "
+               << args_.decoder_head_dim() << " and " << options_.block_size();
+    return false;
+  }
+#endif
   pipeline_ = create_pipeline(pipeline_type, *this);
   // LlmRec-specific initialization
   if (rec_model_kind_ == RecModelKind::kLlmRec) {
@@ -224,6 +244,7 @@ bool RecEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .block_size(block_size)
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
+      .enable_concurrent_allocations(true)
       .max_seqs_per_batch(options_.max_seqs_per_batch());
   kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 
@@ -705,6 +726,8 @@ ForwardOutput RecEngine::OneRecPrefillOnlyEnginePipeline::step(
   Timer timer;
   Timer timer_total;
   // OneRec does not need refresh_forward_type
+  batches[0].set_onerec_batch_input_builder_cache(
+      engine_.input_builder_cache());
   auto forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
   HISTOGRAM_OBSERVE(prepare_input_latency_microseconds,
                     timer.elapsed_microseconds());
@@ -783,6 +806,12 @@ ForwardOutput RecEngine::OneRecPrefillOnlyEnginePipeline::get_model_output(
 
   auto& output = forward_output.value();
   auto& sample_output = output.sample_output;
+  if (is_onerec_single_step_mode() && sample_output.probs.defined()) {
+    sample_output.probs = safe_to(
+        sample_output.probs,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
+        /*non_blocking=*/true);
+  }
 
   if (sample_output.embeddings.defined()) {
     sample_output.embeddings = safe_to(
@@ -839,7 +868,8 @@ RecEngine::OneRecXAttentionEnginePipeline::OneRecXAttentionEnginePipeline(
 
 int64_t RecEngine::OneRecXAttentionEnginePipeline::minimal_kv_cache_blocks()
     const {
-  return kMinimalOneRecMetadataKVBlocks;
+  // Cross-attention K/V now live in the worker block pool.
+  return 0;
 }
 
 ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::step(
@@ -849,6 +879,8 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::step(
   }
 
   Timer timer;
+  batches[0].set_onerec_batch_input_builder_cache(
+      engine_.input_builder_cache());
   auto forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
   HISTOGRAM_OBSERVE(prepare_input_latency_microseconds,
                     timer.elapsed_microseconds());
@@ -916,13 +948,27 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
     }
     CHECK(results[i].value().has_value())
         << "Worker " << i << " failed to execute model and returned no output.";
+    auto& worker_output = results[i].value().value();
+    Device(engine_.workers_[i]->device()).set_device();
+    if (worker_output.ready_event) {
+      CHECK(worker_output.ready_event->synchronize())
+          << "OneRec output event failed for worker " << i;
+      worker_output.ready_event.reset();
+    }
   }
 
   auto forward_output = results.front().value();
   CHECK(forward_output.has_value()) << "Failed to execute model";
 
   auto& output = forward_output.value();
+  Device(engine_.workers_[0]->device()).set_device();
   auto& sample_output = output.sample_output;
+  if (is_onerec_single_step_mode() && sample_output.probs.defined()) {
+    sample_output.probs = safe_to(
+        sample_output.probs,
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32),
+        /*non_blocking=*/true);
+  }
   const bool has_beam_output = output.beam_sequence_group.defined() &&
                                output.beam_sequence_group.numel() > 0;
 
@@ -979,6 +1025,10 @@ ForwardOutput RecEngine::OneRecXAttentionEnginePipeline::get_model_output(
   }
   log_engine_timing("output_d2h_submit");
   log_engine_stage("before_default_stream_sync");
+  if (output.beam_sequence_group_logprobs.defined()) {
+    output.beam_sequence_group_logprobs =
+        safe_to(output.beam_sequence_group_logprobs, torch::kCPU, true);
+  }
   Device(engine_.workers_[0]->device()).synchronize_default_stream();
   log_engine_timing("default_stream_sync");
   log_engine_stage("after_default_stream_sync");
@@ -1141,6 +1191,8 @@ ForwardOutput RecEngine::RecMultiRoundEnginePipeline::step(
 
   Timer timer;
   // Call worker's prepare_inputs (multi-round logic is inside worker)
+  batches[0].set_onerec_batch_input_builder_cache(
+      engine_.input_builder_cache());
   auto forward_inputs = engine_.workers_[0]->prepare_inputs(batches[0]);
   HISTOGRAM_OBSERVE(prepare_input_latency_microseconds,
                     timer.elapsed_microseconds());
@@ -1190,7 +1242,11 @@ ForwardOutput RecEngine::RecMultiRoundEnginePipeline::get_model_output(
 
   // D2H transfer for beam_sequence_group (multi-round results)
   auto& output = forward_output.value();
-  // TODO. uncomment this in next pr.
+  Device(engine_.workers_[0]->device()).set_device();
+  if (output.beam_sequence_group_logprobs.defined()) {
+    output.beam_sequence_group_logprobs =
+        safe_to(output.beam_sequence_group_logprobs, torch::kCPU);
+  }
   output.beam_sequence_group = safe_to(output.beam_sequence_group, torch::kCPU);
   if (output.beam_search_output.out_logprobs.defined()) {
     output.beam_search_output.out_logprobs =

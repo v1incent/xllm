@@ -43,6 +43,7 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_kvcache_store(options_.enable_kvcache_store())
       .enable_host_offload(options_.enable_host_offload())
+      .enable_concurrent_allocations(options_.enable_concurrent_allocations())
       .sliding_window_size(options_.sliding_window_size())
       .swa_blocks_per_seq(options_.swa_blocks_per_seq())
       .swa_num_blocks(options_.swa_num_blocks())
@@ -79,7 +80,8 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
               /*resource_name=*/"embedding block",
               /*exhaustion_message=*/"No more embedding-block ids available");
       if (options_.enable_disagg_pd() || options_.enable_kvcache_store() ||
-          options_.enable_host_offload()) {
+          options_.enable_host_offload() ||
+          options_.enable_concurrent_allocations()) {
         embedding_leaf = std::make_unique<ConcurrentBlockManagerImpl>(
             std::move(embedding_leaf));
       }

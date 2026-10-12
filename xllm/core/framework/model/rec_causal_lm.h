@@ -47,6 +47,42 @@ class RecCausalLMImpl : public RecCausalLM {
     return model_->logits(hidden_states, seleted_idxes);
   }
 
+  torch::Tensor logits(const torch::Tensor& hidden_states,
+                       const torch::Tensor& selected_idxes,
+                       int32_t step) override {
+    if constexpr (detail::has_logits_with_step<Model>::value) {
+      return model_->logits(hidden_states, selected_idxes, step);
+    }
+    return model_->logits(hidden_states, selected_idxes);
+  }
+
+  bool supports_onerec_graph() const override {
+    if constexpr (detail::has_onerec_graph_support<Model>::value) {
+      return model_->supports_onerec_graph();
+    }
+    return RecCausalLM::supports_onerec_graph();
+  }
+
+  torch::Tensor get_onerec_graph_encoder_output() const override {
+    if constexpr (detail::has_get_onerec_graph_encoder_output<Model>::value) {
+      return model_->get_onerec_graph_encoder_output();
+    }
+    return RecCausalLM::get_onerec_graph_encoder_output();
+  }
+
+  void bind_onerec_prefill_graph_buffers(
+      const torch::Tensor& encoder_output,
+      const std::vector<torch::Tensor>& cross_k_caches,
+      const std::vector<torch::Tensor>& cross_v_caches) override {
+    if constexpr (detail::has_bind_onerec_prefill_graph_buffers<Model>::value) {
+      model_->bind_onerec_prefill_graph_buffers(
+          encoder_output, cross_k_caches, cross_v_caches);
+    } else {
+      RecCausalLM::bind_onerec_prefill_graph_buffers(
+          encoder_output, cross_k_caches, cross_v_caches);
+    }
+  }
+
   void load_model(std::unique_ptr<ModelLoader> loader) override {
     model_->load_model(std::move(loader));
   }

@@ -18,8 +18,12 @@ limitations under the License.
 #include <gflags/gflags.h>
 
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 
 #include "common/macros.h"
+#include "core/framework/batch/onerec_batch_input_builder.h"
 #include "distributed_runtime/dist_manager.h"
 #include "engine.h"
 #include "framework/batch/batch.h"
@@ -182,6 +186,7 @@ class RecEngine : public Engine {
   // ============================================================
   // Private methods
   // ============================================================
+  OneRecBatchInputBuilderCache* input_builder_cache();
   bool init_model();
   KVCacheCapacity estimate_kv_cache_capacity();
   bool allocate_kv_cache(const KVCacheCapacity& kv_cache_cap);
@@ -189,6 +194,10 @@ class RecEngine : public Engine {
   // ============================================================
   // Member variables
   // ============================================================
+  std::mutex input_cache_mutex_;
+  std::unordered_map<std::thread::id,
+                     std::unique_ptr<OneRecBatchInputBuilderCache>>
+      input_caches_;
   runtime::Options options_;
   torch::ScalarType dtype_;
   QuantArgs quant_args_;

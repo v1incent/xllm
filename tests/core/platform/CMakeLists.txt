@@ -24,3 +24,13 @@ endif()
 if(USE_MLU)
   add_subdirectory(mlu)
 endif()
+
+if(USE_NPU)
+  # This regression must initialize Python itself through the production path.
+  cc_test(
+    NAME npu_python_runtime_test
+    NO_NPU_INIT
+    SRCS npu_python_runtime_test.cpp
+    DEPS :platform_npu GTest::gtest_main torch torch_npu Python::Python
+  )
+endif()

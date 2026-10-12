@@ -22,11 +22,15 @@ limitations under the License.
 #include <pthread.h>
 
 #include <atomic>
+#include <charconv>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 
+#include "c_api/internal/helper.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
@@ -34,8 +38,14 @@ limitations under the License.
 #include "core/framework/config/rec_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/model_loader.h"
+#include "core/platform/device_name_utils.h"
+#include "core/platform/platform.h"
+#if defined(USE_NPU)
+#include "core/platform/npu/python_runtime.h"
+#endif
 #include "core/util/cpu_affinity.h"
-#include "helper.h"
+#include "core/util/rec_infer_timing.h"
+#include "core/util/timer.h"
 
 XLLM_CAPI_EXPORT XLLM_REC_Handler* xllm_rec_create(void) {
   XLLM_REC_Handler* handler = new XLLM_REC_Handler();
@@ -67,15 +77,46 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
     XLLM_REC_Handler* handler,
     const char* model_path,
     const XLLM_InitOptions* init_options) {
-  if (!handler || !model_path) return false;
+  return xllm_rec_initialize_with_devices(
+      handler, model_path, "auto", init_options);
+}
 
+XLLM_CAPI_EXPORT bool xllm_rec_initialize_with_devices(
+    XLLM_REC_Handler* handler,
+    const char* model_path,
+    const char* devices,
+    const XLLM_InitOptions* init_options) {
+  if (handler == nullptr || model_path == nullptr || devices == nullptr ||
+      handler->initialized) {
+    return false;
+  }
   try {
-    xllm::CpuAffinity::get_instance().set_cpu_affinity(
-        init_options->cpu_affinity);
-
     XLLM_InitOptions xllm_init_options;
     xllm::helper::set_init_options(
         xllm::helper::BackendType::REC, init_options, &xllm_init_options);
+    xllm::CpuAffinity::get_instance().set_cpu_affinity(
+        xllm_init_options.cpu_affinity);
+    int32_t rec_device_index = -1;
+    const std::string_view device_name(devices);
+    if (!device_name.empty() && device_name != "auto") {
+      const size_t colon = device_name.find(':');
+      if (colon == std::string_view::npos ||
+          device_name.substr(0, colon) != xllm::Platform::type_str()) {
+        LOG(ERROR) << "Expected a single logical device such as npu:0";
+        return false;
+      }
+      const char* first = device_name.data() + colon + 1;
+      const char* last = device_name.data() + device_name.size();
+      const auto result = std::from_chars(first, last, rec_device_index);
+      if (result.ec != std::errc{} || result.ptr != last ||
+          rec_device_index < 0 ||
+          rec_device_index >= xllm::Platform::device_count() ||
+          xllm_init_options.nnodes != 1) {
+        LOG(ERROR)
+            << "Invalid logical device or multi-node embedded REC request";
+        return false;
+      }
+    }
 
     std::string log_dir(xllm_init_options.log_dir);
     if (!log_dir.empty()) {
@@ -87,11 +128,18 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
       return false;
     }
 
+    std::filesystem::path normalized_model_path =
+        std::filesystem::path(model_path).lexically_normal();
+    while (!normalized_model_path.has_filename() &&
+           normalized_model_path != normalized_model_path.root_path()) {
+      normalized_model_path = normalized_model_path.parent_path();
+    }
     xllm::Options options;
-    options.model_path(model_path)
+    options.model_path(normalized_model_path.string())
         .task_type(xllm_init_options.task)
         .draft_model_path(xllm_init_options.draft_model)
         .backend("rec")
+        .rec_device_index(rec_device_index)
         .block_size(xllm_init_options.block_size)
         .max_cache_size(xllm_init_options.max_cache_size)
         .max_memory_utilization(xllm_init_options.max_memory_utilization)
@@ -111,6 +159,7 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
         .nnodes(xllm_init_options.nnodes)
         .node_rank(xllm_init_options.node_rank)
         .dp_size(xllm_init_options.dp_size)
+        .cp_size(xllm_init_options.cp_size)
         .ep_size(xllm_init_options.ep_size)
         .instance_name(xllm_init_options.instance_name)
         .enable_disagg_pd(xllm_init_options.enable_disagg_pd)
@@ -152,6 +201,27 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
         .max_decode_rounds(xllm_init_options.max_decode_rounds)
         .enable_rec_prefill_only(xllm_init_options.enable_rec_prefill_only)
         .enable_rec_fast_sampler(xllm_init_options.enable_rec_fast_sampler)
+        .enable_constrained_decoding(
+            xllm_init_options.enable_constrained_decoding)
+        .enable_convert_tokens_to_item(
+            xllm_init_options.enable_convert_tokens_to_item)
+        .enable_output_sku_logprobs(
+            xllm_init_options.enable_output_sku_logprobs)
+        .enable_extended_item_info(xllm_init_options.enable_extended_item_info)
+        .each_conversion_threshold(xllm_init_options.each_conversion_threshold)
+        .total_conversion_threshold(
+            xllm_init_options.total_conversion_threshold)
+        .enable_onerec_prefill_acl_graph(
+            xllm_init_options.enable_onerec_prefill_acl_graph)
+        .enable_multistream_perf_mode(
+            xllm_init_options.enable_multistream_perf_mode)
+        .enable_onerec_async_perf(xllm_init_options.enable_onerec_async_perf)
+        .enable_onerec_multistream_core_split(
+            xllm_init_options.enable_onerec_multistream_core_split)
+        .onerec_multistream_core_ratio(
+            xllm_init_options.onerec_multistream_core_ratio)
+        .constrained_decoding_filter_path(
+            xllm_init_options.constrained_decoding_filter_path)
         .enable_xattention_one_stage(
             xllm_init_options.enable_xattention_one_stage)
         .rec_worker_max_concurrency(
@@ -170,11 +240,13 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
     xllm::KVCacheConfig::get_instance()
         .block_size(xllm_init_options.block_size)
         .enable_prefix_cache(xllm_init_options.enable_prefix_cache);
-    xllm::ModelConfig::get_instance().flashinfer_workspace_buffer_size(
-        static_cast<int32_t>(
+    xllm::ModelConfig::get_instance()
+        .backend("rec")
+        .flashinfer_workspace_buffer_size(static_cast<int32_t>(
             xllm_init_options.flashinfer_workspace_buffer_size));
     xllm::ExecutionConfig::get_instance()
         .enable_graph(xllm_init_options.enable_graph)
+        .max_tokens_for_graph_mode(xllm_init_options.max_tokens_for_graph_mode)
         .enable_prefill_piecewise_graph(
             xllm_init_options.enable_prefill_piecewise_graph)
         .enable_graph_mode_decode_no_padding(
@@ -185,6 +257,7 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
 #endif
     // Keep dual-source settings aligned with the Config values above.
     options.enable_graph(::xllm::ExecutionConfig::get_instance().enable_graph())
+        .max_tokens_for_graph_mode(xllm_init_options.max_tokens_for_graph_mode)
         .beam_width(::xllm::BeamSearchConfig::get_instance().beam_width())
         .rec_worker_max_concurrency(
             ::xllm::RecConfig::get_instance().rec_worker_max_concurrency());
@@ -205,7 +278,19 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
         << ", max_decode_rounds="
         << ::xllm::RecConfig::get_instance().max_decode_rounds();
 
+#if defined(USE_NPU)
+    const int32_t runtime_device_index =
+        rec_device_index >= 0 ? rec_device_index
+                              : xllm::DeviceNameUtils::get_device_idx(
+                                    xllm_init_options.node_rank,
+                                    xllm_init_options.nnodes,
+                                    xllm::Platform::device_count());
+    if (!xllm::npu::init_python_runtime(runtime_device_index)) {
+      return false;
+    }
+#endif
     handler->master = std::make_unique<xllm::RecMaster>(options);
+    handler->pipeline_type = handler->master->pipeline_type();
     handler->master->run();
 
     size_t available_cpu_cores_count =
@@ -221,8 +306,7 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
     handler->executor = std::make_unique<folly::CPUThreadPoolExecutor>(
         thread_num, std::move(thread_factory));
 
-    std::filesystem::path model_path_fs =
-        std::filesystem::path(model_path).lexically_normal();
+    const std::filesystem::path& model_path_fs = normalized_model_path;
     std::string model_id;
     if (model_path_fs.has_filename()) {
       model_id = model_path_fs.filename().string();
@@ -352,6 +436,86 @@ XLLM_CAPI_EXPORT XLLM_Response* xllm_rec_multimodal_completions(
       static_cast<void*>(&internal_mm_data),
       timeout_ms,
       request_params);
+}
+
+XLLM_CAPI_EXPORT XLLM_Response* xllm_rec_input_tensors_completions(
+    XLLM_REC_Handler* handler,
+    const char* model_id,
+    const XLLM_InferInputTensorDesc* tensors,
+    size_t tensor_count,
+    uint32_t timeout_ms,
+    const XLLM_RequestParams* request_params) {
+  const std::string request_id =
+      xllm::helper::resolve_request_id(request_params);
+  try {
+    if (handler == nullptr || model_id == nullptr || *model_id == '\0' ||
+        tensors == nullptr || tensor_count == 0) {
+      return xllm::helper::build_error_response(
+          request_id,
+          XLLM_StatusCode::kInvalidRequest,
+          "Invalid Tensor inference parameters");
+    }
+    if (!handler->initialized) {
+      return xllm::helper::build_error_response(
+          request_id,
+          XLLM_StatusCode::kNotInitialized,
+          "REC is not initialized");
+    }
+    xllm::rec_infer_timing::begin_request(request_id);
+    xllm::MMData input;
+    std::string error;
+    xllm::Timer timer;
+    if (!xllm::helper::convert_c_infer_input_tensors_to_onerec_mm_data(
+            tensors, tensor_count, &input, &error)) {
+      return xllm::helper::build_error_response(
+          request_id, XLLM_StatusCode::kInvalidRequest, error);
+    }
+    xllm::rec_infer_timing::set_convert_input_tensors_us(
+        request_id, static_cast<int64_t>(timer.elapsed_microseconds()));
+    XLLM_RequestParams params;
+    xllm_rec_request_params_default(&params);
+    if (request_params != nullptr) {
+      params = *request_params;
+    }
+    std::snprintf(
+        params.request_id, sizeof(params.request_id), "%s", request_id.c_str());
+    return xllm::helper::handle_inference_request(
+        handler,
+        xllm::helper::InferenceType::REC_COMPLETIONS,
+        model_id,
+        input,
+        nullptr,
+        timeout_ms,
+        &params);
+  } catch (const std::exception& error) {
+    return xllm::helper::build_error_response(
+        request_id, XLLM_StatusCode::kInternalError, error.what());
+  } catch (...) {
+    return xllm::helper::build_error_response(request_id,
+                                              XLLM_StatusCode::kInternalError,
+                                              "Unknown Tensor inference error");
+  }
+}
+
+XLLM_CAPI_EXPORT bool xllm_rec_take_last_infer_timing(
+    const char* request_id,
+    XLLM_InferTimingDetail* out) {
+  if (request_id == nullptr || *request_id == '\0' || out == nullptr) {
+    return false;
+  }
+  xllm::rec_infer_timing::InferTimingDetail detail;
+  if (!xllm::rec_infer_timing::take(request_id, &detail)) {
+    return false;
+  }
+  *out = {};
+  std::snprintf(out->request_id, sizeof(out->request_id), "%s", request_id);
+  out->convert_input_tensors_us = detail.convert_input_tensors_us;
+  out->threadpool_wait_us = detail.threadpool_wait_us;
+  out->build_request_us = detail.build_request_us;
+  out->scheduler_infer_us = detail.scheduler_infer_us;
+  out->generate_output_us = detail.generate_output_us;
+  out->build_response_us = detail.build_response_us;
+  return true;
 }
 
 XLLM_CAPI_EXPORT XLLM_Response* xllm_rec_chat_completions(

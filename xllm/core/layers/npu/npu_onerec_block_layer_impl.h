@@ -1,4 +1,4 @@
-/* Copyright 2025-2026 The xLLM Authors.
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -63,6 +63,9 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
                         aclrtEvent* event = nullptr,
                         std::atomic<bool>* event_flag = nullptr,
                         const torch::Tensor& expert_array = torch::Tensor());
+
+  void set_cross_kv_cache_for_graph(const torch::Tensor& k_cache,
+                                    const torch::Tensor& v_cache);
 
  private:
   void param_from_args(atb_speed::onerec::BlockLayerParam& param,
@@ -163,6 +166,8 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
   int32_t layer_id_ = 0;
 
   std::unordered_map<std::string, std::vector<torch::Tensor>> experts_weights_;
+  torch::Tensor fused_expert_weight1_scale_;
+  torch::Tensor fused_expert_weight2_scale_;
   std::mutex experts_mutex_;
   int32_t start_expert_id_ = 0;
   int32_t end_expert_id_ = 0;

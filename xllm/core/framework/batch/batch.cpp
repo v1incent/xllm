@@ -229,16 +229,18 @@ ForwardInput Batch::prepare_rec_forward_input(uint32_t num_decoding_tokens,
     }
   }
 
-  auto builder = RecBatchInputBuilder::create(rec_type,
-                                              sequence_groups_,
-                                              allowed_max_tokens_,
-                                              input_embeddings_vec_,
-                                              mm_data_vec_,
-                                              &swap_block_transfer_infos_,
-                                              batch_id_,
-                                              &args,
-                                              batch_forward_type_,
-                                              thread_pool);
+  auto builder =
+      RecBatchInputBuilder::create(rec_type,
+                                   sequence_groups_,
+                                   allowed_max_tokens_,
+                                   input_embeddings_vec_,
+                                   mm_data_vec_,
+                                   &swap_block_transfer_infos_,
+                                   batch_id_,
+                                   &args,
+                                   batch_forward_type_,
+                                   thread_pool,
+                                   onerec_batch_input_builder_cache_);
   return builder->build_rec_forward_input(num_decoding_tokens,
                                           min_decoding_batch_size);
 }
@@ -615,9 +617,6 @@ void Batch::process_beam_sequence_group(const ForwardOutput& output) {
   }
 
   const int32_t beam_width = sequences[0]->sampling_param()->beam_width;
-  if (beam_width <= 1) {
-    return;
-  }
   const int32_t result_width =
       output.beam_sequence_group.defined()
           ? static_cast<int32_t>(output.beam_sequence_group.size(1))
@@ -638,6 +637,16 @@ void Batch::process_beam_sequence_group(const ForwardOutput& output) {
   bool has_logprobs = output.beam_search_output.out_logprobs.defined() &&
                       output.beam_search_output.out_logprobs.numel() > 0;
 
+  const auto& token_logprobs = output.beam_sequence_group_logprobs;
+  const bool has_token_logprobs = token_logprobs.defined();
+  if (has_token_logprobs) {
+    CHECK_EQ(token_logprobs.sizes(), output.beam_sequence_group.sizes());
+    CHECK(token_logprobs.is_cpu());
+    CHECK_EQ(token_logprobs.scalar_type(), torch::kFloat32);
+  }
+  CHECK_EQ(static_cast<size_t>(output.beam_sequence_group.size(0)), num_groups);
+  std::vector<std::vector<float>> group_logprobs;
+  group_logprobs.reserve(static_cast<size_t>(result_width));
   std::vector<std::vector<int32_t>> group_flat2d;
   std::vector<float> last_logprobs;
   group_flat2d.reserve(static_cast<size_t>(result_width));
@@ -645,6 +654,7 @@ void Batch::process_beam_sequence_group(const ForwardOutput& output) {
 
   for (size_t g = 0; g < num_groups; ++g) {
     group_flat2d.clear();
+    group_logprobs.clear();
     last_logprobs.clear();
 
     for (int b = 0; b < result_width; ++b) {
@@ -655,6 +665,11 @@ void Batch::process_beam_sequence_group(const ForwardOutput& output) {
         row_tokens.push_back(seq_group_accessor[g][b][c]);
       }
       group_flat2d.emplace_back(std::move(row_tokens));
+      if (has_token_logprobs) {
+        const auto values = token_logprobs.accessor<float, 3>();
+        group_logprobs.emplace_back(values[g][b].data(),
+                                    values[g][b].data() + total_rounds);
+      }
       if (has_logprobs) {
         // logprobs is flattened [batch * result_width] for multi-round widened
         // final output.
@@ -667,14 +682,29 @@ void Batch::process_beam_sequence_group(const ForwardOutput& output) {
     Sequence* seq = sequence_groups_.empty()
                         ? sequences[g]
                         : sequence_groups_[g]->sequences()[0].get();
-    seq->set_beam_result(
-        result_width, total_rounds, group_flat2d, last_logprobs);
+    seq->set_beam_result(result_width,
+                         total_rounds,
+                         group_flat2d,
+                         last_logprobs,
+                         group_logprobs);
   }
 }
 
 void Batch::process_sample_output(const SampleOutput& sample_output,
                                   bool replace_fake_token,
                                   bool force_requested_beam_result_size) {
+  const auto rec_sequences = get_sequences();
+  if (is_onerec_single_step_mode() && !rec_sequences.empty() &&
+      rec_sequences.front()->is_onerec_model()) {
+    CHECK(sample_output.probs.defined());
+    CHECK(sample_output.probs.is_cpu());
+    CHECK_EQ(sample_output.probs.dim(), 2);
+    CHECK_EQ(sample_output.probs.size(0), rec_sequences.size());
+    for (size_t i = 0; i < rec_sequences.size(); ++i) {
+      rec_sequences[i]->update_embeddings(sample_output.probs[i]);
+    }
+    return;
+  }
   if (sample_output.embeddings.defined()) {
     const int64_t num_seqs = sample_output.embeddings.size(0);
     int64_t output_idx = 0;

@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/runtime/acl_graph_persistent_param.h"
+#include "core/runtime/onerec_acl_graph_executor.h"
 #include "executor_impl.h"
 #include "executor_impl_factory.h"
 #include "options.h"
@@ -216,6 +217,7 @@ class AclGraphExecutorImpl : public ExecutorImpl {
   }
 
  private:
+  std::unique_ptr<OneRecAclGraphExecutor> onerec_graph_executor_;
   // not own
   CausalLM* model_;
 

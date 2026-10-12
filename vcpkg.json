@@ -3,6 +3,10 @@
   "version": "0.0.1",
   "dependencies": [
     {
+      "name": "asio",
+      "version>=": "1.29.0"
+    },
+    {
       "name": "abseil",
       "version>=": "20230125.3"
     },

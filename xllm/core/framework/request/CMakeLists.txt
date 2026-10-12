@@ -22,6 +22,7 @@ cc_library(
     sequence_kv_state.h
     sequences_group.h
     request_state.h
+    rec_item_utils.h
     rec_type.h
     stopping_checker.h
     priority_comparator.h
@@ -37,6 +38,7 @@ cc_library(
     request_params.cpp
     sample_slot.cpp
     dit_request_params.cpp
+    rec_item_utils.cpp
     sequence.cpp
     sequence_logprob_state.cpp
     sequence_kv_state.cpp

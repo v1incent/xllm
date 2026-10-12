@@ -37,7 +37,8 @@ std::unique_ptr<RecBatchInputBuilder> RecBatchInputBuilder::create(
     uint64_t batch_id,
     const ModelArgs* args,
     BatchForwardType batch_forward_type,
-    MPMCThreadPool* thread_pool) {
+    MPMCThreadPool* thread_pool,
+    OneRecBatchInputBuilderCache* perf_cache) {
   switch (rec_type) {
     case RecType::kOneRec:
       if (is_onerec_xattention_mode()) {
@@ -50,7 +51,8 @@ std::unique_ptr<RecBatchInputBuilder> RecBatchInputBuilder::create(
             batch_id,
             args,
             batch_forward_type,
-            thread_pool);
+            thread_pool,
+            perf_cache);
       }
       return std::make_unique<OneRecBatchInputBuilder>(
           sequence_groups,
@@ -61,7 +63,8 @@ std::unique_ptr<RecBatchInputBuilder> RecBatchInputBuilder::create(
           batch_id,
           args,
           batch_forward_type,
-          thread_pool);
+          thread_pool,
+          perf_cache);
     case RecType::kLlmRec:
       // Check if Rec multi-round mode is enabled
       if (is_rec_multi_round_mode()) {
