@@ -2,7 +2,7 @@
 
 The REC source adaptation is implemented and has passed the validation listed
 below. This is a migration candidate, not deployment approval. Historical
-predictor AB, batching acceptance and dependency publication remain open.
+predictor AB and batching acceptance remain open.
 
 ## Source boundaries
 
@@ -162,10 +162,11 @@ Logical `npu:0` with `ASCEND_RT_VISIBLE_DEVICES=4` was verified to map to physic
 4; check occupancy again before running tests.
 
 See [rec_tensor_demo.md](rec_tensor_demo.md) for build and invocation examples.
-The validation environment reuses an older vcpkg installation without ASIO.
-Its Mooncake TCP headers come from yalantinglibs (ASIO 1.24.0), so configure
-`ASIO_INCLUDE_DIR=/usr/local/yalantinglibs/include` there as well. Mixing those
-headers with an independently selected ASIO 1.29.0 implementation fails linking.
+The October 12 validation reused an older vcpkg installation without ASIO.
+Its Mooncake TCP headers came from yalantinglibs (ASIO 1.24.0), so that build
+used `ASIO_INCLUDE_DIR=/usr/local/yalantinglibs/include`. This setting is specific
+to that dependency layout. The October 26 environment also contains ASIO 1.29.0
+in vcpkg and uses its include directory consistently instead (see below).
 Fresh dependency installations should use the ASIO declared in `vcpkg.json`
 consistently for every Mooncake target.
 Synthetic embeddings check execution/repeatability only. Real predictor
@@ -185,17 +186,102 @@ comparison. Oxygen graph3 does not supply W8A8 or split-head weight coverage.
    with representative assets; Oxygen's BF16 checkpoint does not cover them.
 4. Run sustained concurrency/throughput and teardown/resource stability tests
    before making performance or deployment claims.
-5. Publish the pinned dependency commits to accessible forks before ordinary
-   recursive cloning/CI from the parent fork. Local bundle restoration is
-   provided and independently checked.
 
 ## Dependency checkpoints
 
 - `xllm_ops`: `5ecb9620391d0fb12bcd809927ee8a819e4df94b`.
 - `xllm_atb_layers`: `e2e85fac8ed0d3255c32943cdbc50f56538771fa`.
 
-Both commits are stored in local Git bundles and have been restored into
-independent repositories and compared with the changed source files. They
-have not been published. Before normal recursive cloning from the fork can
-work, publish these commits to accessible dependency repositories and update
-the submodule URLs, or restore the exact commits from the supplied bundles.
+Both commits were published on October 26, 2026, to the
+`migration/rec-v0.9-to-v0.11` branch in these forks:
+
+- `https://gitcode.com/gcw_c6c5Lhcp/xllm_ops.git`
+- `https://gitcode.com/gcw_c6c5Lhcp/xllm_atb_layers.git`
+
+Parent commit `a59ec322365b0c206676d625f17b9720a9b21a3f` updates the two
+`.gitmodules` URLs and preserves both pinned commits. It is published on the
+same migration branch in `https://github.com/v1incent/xllm.git`. Fetch URLs
+remain HTTPS; local pushes to the dependency forks use SSH.
+
+## Fork publication verification — October 26, 2026
+
+- Anonymous HTTPS fetches of both exact dependency SHAs succeeded from
+  independent repositories. Both remote migration branches match their pins.
+- A fresh remote clone with `--depth 1 --recurse-submodules --shallow-submodules`
+  fetched all 19 nested submodules at the recorded commits without local
+  bundles or object references.
+- On case-insensitive macOS, the pinned PTO repository has case-colliding
+  document names; three documents show as modified after checkout. This is a
+  filesystem limitation, not a changed submodule commit. Use a case-sensitive
+  filesystem for a complete clean working tree.
+- A complete snapshot was exported directly from the freshly fetched Git
+  objects, preserving both spellings and exact symlink contents. On Linux in
+  the 99 validation container, all 28,645 tracked files passed SHA256 checks;
+  the parent and recursive submodules have a clean Git status. Git operations
+  on 99 were read-only.
+
+The verification directory is
+`/export/home/zhanghe209/projects/xllm-validation/20261026-forks` on 99.
+The build uses an isolated source tree and operator vendor directory. Existing
+vcpkg and system/toolkit dependencies are reused; this does not establish a
+fresh installation of every external dependency or historical predictor AB.
+
+
+### Build and regression results
+
+- The selected operator package was compiled from the published `xllm_ops`
+  commit, packaged and installed into the separate validation vendor directory.
+  The Python operator test extension also compiled successfully.
+- TileLang generation completed for all ten kernel families.
+- The final full native build passed after the dependency layout was made
+  consistent. It produced `libxllm.so`
+  (`18f5ffca5f111484a605a01173b31bd2b712e165f24ab7cab2dfd0ad644185fe`) and
+  `test_query_rec_input_tensors`
+  (`aa2f47983cbd846c2212564853303363f20182dd34de0fa2fc4119be21176553`).
+- The REC CPU regressions passed **19/19 with zero failures or skips**. The two
+  additional MPMC thread-pool shutdown regressions passed **2/2**, for
+  **21 formal CPU cases total**. `test_query_rec_input_tensors --help` also
+  passed.
+- Reusing downloaded operator dependencies required passing the actual
+  `CPACK_MAKESELF_PATH` to CPack. The initial package step failed because it
+  searched a different makeself location; the explicit-path retry passed.
+- The root CMake configuration also expects headers under
+  `build/native/vcpkg_installed/arm64-linux/include`. A validation-only symlink
+  points that location at the reused installation. Set up this path before
+  compilation when using an external `VCPKG_INSTALLED_DIR`.
+- The reused installation now contains ASIO 1.29.0. Set
+  `ASIO_INCLUDE_DIR=${VCPKG_INSTALLED_DIR}/arm64-linux/include` for this layout.
+  An initial mixed 1.24/1.29 build failed at link time; rebuilding the standalone
+  implementation without changing its include priority was insufficient.
+  The subsequent build uses the same 1.29 headers for the implementation and
+  consumers. The failed attempts and final dependency checks are retained.
+- A transient `/tmp` compiler write hit the full shared disk during the first
+  native build. The failed attempt was preserved. The native and output
+  directories were moved to a validation-owned temporary filesystem and later
+  restored to the isolated persistent validation directory; 5,221,963,968 bytes
+  were moved back and the recorded artifact hashes were verified again. No
+  pre-existing user files were deleted.
+- The `torch_npu_ops` build hook automatically ran its Triton device tests:
+  **210 passed and two skipped**, producing 45 kernel binaries. This hook
+  cleared and repopulated the container-default `/root/.triton/cache` before
+  the behavior was identified; it had already exited when a targeted stop was
+  attempted. Subsequent validation invocations set an isolated
+  `TRITON_CACHE_DIR`. These build-hook results are separate from the planned
+  REC operator and Oxygen regression suites.
+- The planned current-run device regressions were **not run**: the 51-case REC
+  operator suite, NPU Python runtime regression, and Oxygen eager/graph smoke
+  all require a device. Every physical chip had an active process from another
+  container; the process visible on physical device 4 was confirmed through the
+  host cgroup to belong to that other container. No other task was stopped.
+- After the build, all 28,645 tracked source files again passed SHA256
+  verification, and all 20 repository HEADs matched their recorded pins.
+  The ASIO implementation and its 89 relevant consumer objects all used the
+  same 1.29 headers. `ldd` found no missing dependency and `libxllm.so` linked
+  to the isolated validation `libcust_opapi.so`; the exported REC completion
+  symbol was verified with `nm`. The four shared installed operator libraries
+  also remained byte-for-byte unchanged.
+
+Commands, exit codes, original failed-attempt logs and artifact SHA256 hashes
+are retained under the validation directory's `evidence/` subdirectory.
+The published migration source and both dependency pins were unchanged by
+these environment and build-directory adjustments.
