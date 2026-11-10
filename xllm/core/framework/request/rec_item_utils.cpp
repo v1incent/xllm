@@ -62,13 +62,11 @@ void decode_rec_items(const Tokenizer& tokenizer,
   for (const auto& candidate : candidates) {
     ids.emplace_back(candidate.item_id);
   }
-  const int32_t random_seed = ExecutionConfig::get_instance().random_seed();
-  const uint32_t seed = random_seed >= 0
-                            ? static_cast<uint32_t>(random_seed) +
-                                  static_cast<uint32_t>(sequence_index)
-                            : std::random_device{}();
   const auto indices = select_unique_rec_item_indices(
-      ids, config.each_conversion_threshold(), seed);
+      ids,
+      config.each_conversion_threshold(),
+      ExecutionConfig::get_instance().random_seed(),
+      sequence_index);
   output.item_ids_list.reserve(indices.size());
   if (extended) {
     output.item_infos_list.reserve(indices.size());

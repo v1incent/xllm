@@ -7,7 +7,9 @@
 #include <string>
 
 #include "common/global_flags.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/rec_config.h"
+#include "core/util/rec_item_sampling.h"
 #include "util/timer.h"
 
 namespace xllm {
@@ -235,9 +237,12 @@ bool RecVocabDict::get_item_infos_by_tokens(
     return false;
   }
 
-  std::copy(iter->second.begin(),
-            iter->second.end(),
-            std::back_inserter(*item_infos));
+  append_sampled_rec_items(
+      iter->second,
+      RecConfig::get_instance().each_conversion_threshold(),
+      ExecutionConfig::get_instance().random_seed(),
+      /*sequence_index=*/0,
+      item_infos);
   return true;
 }
 

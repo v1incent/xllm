@@ -45,8 +45,9 @@ relationship to the migrated release is unverified.
   not produce NaN from infinity subtraction.
 - Single-step `vocab_probs` output keeps FP32 sampler probabilities after
   filtering, temperature, top-k and top-p. A split first head returns only its
-  first segment. Item conversion deduplicates IDs, retains matching metadata,
-  and bounds random sampling by the requested item limit.
+  first segment. Item conversion samples dictionary entries before copying,
+  then samples aggregated candidates before deduplicating IDs, retaining the
+  first sampled metadata for each ID (the v0.9 behavior).
 - A Tensor C API validation demo, raw-output tests, beam/item/timing tests, and
   CrossAttention and constrained Top-K operator tests.
 - A shared Python/NPU bootstrap for the server and embedded REC C API. It
@@ -66,6 +67,38 @@ block size 128. Unsupported values fail model initialization. The fused
 constrained Top-K path remains opt-in through
 `XLLM_ENABLE_ONEREC_FUSED_CONSTRAINED_TOPK` because model comparison found
 different ordering for tied scores (see below).
+
+## Dictionary sampling follow-up — November 10, 2026
+
+The local follow-up on `39400ec0` restores dictionary-level early sampling
+from `4fb40793`. Both ID-only and extended metadata lookups use the shared
+`core/util/rec_item_sampling.h` helper. `each_conversion_threshold=1` copies
+one randomly indexed entry without traversing the full dictionary list.
+Nonpositive limits return all entries; limits at least as large as the list
+preserve source order. Larger partial samples retain v0.9 distinct-index
+rejection sampling; its runtime increases when the limit approaches list size.
+The loaded dictionary and constrained-decoding tables remain complete.
+
+Output normalization also samples before deduplication, so duplicate IDs can
+reduce the returned count below the limit. Sampling entries preserves their
+relative selection weights and keeps each selected ID/DID/type together.
+Configuration comes from `RecConfig` and `ExecutionConfig`. Fixed seeds use
+`random_seed + sequence_index` with uint32 arithmetic; dictionary lookups use
+index zero. An unset seed uses a persistent thread-local generator.
+
+Local validation on macOS with Clang and GoogleTest passed all eight
+`rec_item_utils_test` cases, including a 100,000-entry copy-count regression
+for limits 1 and 17. A separate comparison against the original v0.9 helper
+and normalization source matched all 980 fixed-seed combinations, covering
+empty, capped, uncapped, duplicate and uint32 sequence-wrap cases. This
+comparison used the same C++ standard library for both versions; it does not
+promise identical random sequences across standard-library implementations.
+
+Three dictionary integration cases were added to `rec_vocab_dict_test` for
+large lookups, uncapped/missing keys and extended metadata. They could not be
+built locally because the generated `common.pb.h` and the complete project
+build dependencies are unavailable. CANN/NPU execution and real-codebook
+CPU-time/memory measurements have not been rerun for this follow-up.
 
 ## Validation record — October 12, 2026
 

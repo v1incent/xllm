@@ -20,6 +20,7 @@ cc_library(
     net.h
     pretty_print.h
     rec_model_utils.h
+    rec_item_sampling.h
     rec_infer_timing.h
     scope_guard.h
     slice.h

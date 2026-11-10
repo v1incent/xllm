@@ -77,6 +77,8 @@ class RecVocabDict final {
 
   /**
    * @brief Get the corresponding item ID list through a token ID triplet
+   * Appends up to each_conversion_threshold sampled dictionary entries;
+   * a nonpositive threshold appends all entries. Does not deduplicate IDs.
    * @param token_ids, a token ID triplet, so token_ids size must be three
    * @param item_ids, output mapping item id list
    * @return true represents successful gain, false represents failed gain
@@ -84,6 +86,7 @@ class RecVocabDict final {
   bool get_items_by_tokens(const RecTokenTriple& rec_token_triple,
                            std::vector<int64_t>* item_ids) const;
 
+  // Same sampling and append semantics as get_items_by_tokens, with metadata.
   bool get_item_infos_by_tokens(const RecTokenTriple& rec_token_triple,
                                 std::vector<RecItemInfo>* item_infos) const;
 

@@ -15,40 +15,38 @@ limitations under the License.
 
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
-#include <numeric>
-#include <random>
 #include <unordered_set>
 #include <vector>
+
+#include "core/util/rec_item_sampling.h"
 
 namespace xllm {
 class Tokenizer;
 struct SequenceOutput;
 
-// Keep the first metadata entry for each item. Shuffle only the selected
-// prefix, so sampling work is bounded by the configured conversion limit.
+// Sample raw entries first, then keep the first sampled metadata entry for
+// each item, matching v0.9. Duplicates may reduce the result below the limit.
 inline std::vector<size_t> select_unique_rec_item_indices(
     const std::vector<int64_t>& item_ids,
     int32_t limit,
-    uint32_t seed) {
+    int32_t random_seed,
+    size_t sequence_index = 0) {
+  const size_t count =
+      limit <= 0 ? item_ids.size()
+                 : std::min(item_ids.size(), static_cast<size_t>(limit));
   std::vector<size_t> indices;
-  indices.reserve(item_ids.size());
+  indices.reserve(count);
   std::unordered_set<int64_t> seen;
-  seen.reserve(item_ids.size());
-  for (size_t i = 0; i < item_ids.size(); ++i) {
-    if (seen.insert(item_ids[i]).second) {
-      indices.emplace_back(i);
-    }
-  }
-  if (limit <= 0 || indices.size() <= static_cast<size_t>(limit)) {
-    return indices;
-  }
-  std::mt19937 generator(seed);
-  for (size_t i = 0; i < static_cast<size_t>(limit); ++i) {
-    std::uniform_int_distribution<size_t> distribution(i, indices.size() - 1);
-    std::swap(indices[i], indices[distribution(generator)]);
-  }
-  indices.resize(static_cast<size_t>(limit));
+  seen.reserve(count);
+  for_each_sampled_rec_item_index(
+      item_ids.size(), limit, random_seed, sequence_index, [&](size_t index) {
+        if (seen.insert(item_ids[index]).second) {
+          indices.emplace_back(index);
+        }
+      });
   return indices;
 }
 
