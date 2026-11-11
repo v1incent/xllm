@@ -686,6 +686,7 @@ struct ForwardOutput {
 
   BeamSearchOutput beam_search_output;
   torch::Tensor beam_sequence_group;
+  // Parent-aligned cumulative prefix scores.
   torch::Tensor beam_sequence_group_logprobs;
 
   // dit output data

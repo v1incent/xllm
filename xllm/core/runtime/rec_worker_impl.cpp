@@ -2381,7 +2381,6 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         output_logprobs) {
       runtime::detail::write_beam_round_step_logprobs(
           beam_tensors.out_log_probs,
-          beam_tensors.acc_logprob,
           beam_tensors.out_token_index,
           batch_size,
           round,
@@ -2912,7 +2911,6 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_beam_search(
 #endif
   runtime::detail::write_beam_round_step_logprobs(
       beam_tensors.out_log_probs,
-      beam_tensors.acc_logprob,
       beam_tensors.out_token_index,
       batch_size,
       round,
@@ -2940,7 +2938,6 @@ void RecWorkerImpl::LlmRecMultiRoundPipeline::execute_final_beam_search(
 
   runtime::detail::write_beam_round_step_logprobs(
       beam_tensors.out_log_probs,
-      beam_tensors.acc_logprob,
       beam_tensors.out_token_index,
       batch_size,
       round,

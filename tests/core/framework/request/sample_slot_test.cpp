@@ -403,12 +403,18 @@ TEST(SampleSlotTest, RequestOutputStableSortsOutOfOrderSampleIds) {
   EXPECT_EQ(output.outputs[2].text, "C");
 }
 
-TEST(SampleSlotTest, OneRecOutputCarriesTokenLogprobsWhenEnabled) {
-  ScopedBoolFlag enable_output_sku_logprobs(
-      &RecConfig::get_instance().enable_output_sku_logprobs(), true);
-  ScopedBoolFlag enable_convert_tokens_to_item(
-      &RecConfig::get_instance().enable_convert_tokens_to_item(), false);
+class RecScoreOutputTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_ = RecConfig::get_instance();
+    RecConfig::get_instance() = RecConfig{};
+    RecConfig::get_instance().enable_output_sku_logprobs(true);
+  }
+  void TearDown() override { RecConfig::get_instance() = saved_; }
+  RecConfig saved_;
+};
 
+TEST_F(RecScoreOutputTest, OneRecOutputPreservesLegacyPerTokenLogprobs) {
   CharTokenizer tokenizer;
   RequestSamplingParam sampling_param;
   sampling_param.logprobs = true;
@@ -463,6 +469,68 @@ TEST(SampleSlotTest, OneRecOutputCarriesTokenLogprobsWhenEnabled) {
   EXPECT_FLOAT_EQ(output.outputs[0].token_ids_logprobs[0].value(), -0.10f);
   EXPECT_FLOAT_EQ(output.outputs[0].token_ids_logprobs[1].value(), -0.20f);
   EXPECT_FLOAT_EQ(output.outputs[0].token_ids_logprobs[2].value(), -0.30f);
+
+  // OneRec decoder indices start after BOS, not after the encoder input.
+  // A missing per-token score does not invalidate later known scores.
+  seq->update_token(seq->num_prompt_tokens() + 1, Token(102));
+  output = request.generate_output(tokenizer);
+  ASSERT_EQ(output.outputs.size(), 1);
+  EXPECT_EQ(output.outputs[0].token_ids, (std::vector<int32_t>{101, 102, 103}));
+  ASSERT_EQ(output.outputs[0].token_ids_logprobs.size(), 3U);
+  ASSERT_TRUE(output.outputs[0].token_ids_logprobs[0].has_value());
+  EXPECT_FLOAT_EQ(output.outputs[0].token_ids_logprobs[0].value(), -0.10f);
+  EXPECT_FALSE(output.outputs[0].token_ids_logprobs[1].has_value());
+  ASSERT_TRUE(output.outputs[0].token_ids_logprobs[2].has_value());
+  EXPECT_FLOAT_EQ(output.outputs[0].token_ids_logprobs[2].value(), -0.30f);
+}
+
+TEST_F(RecScoreOutputTest, MultiRoundScoresStayAlignedAfterFinalRanking) {
+  RecConfig::get_instance().max_decode_rounds(3);
+  CharTokenizer tokenizer;
+  RequestSamplingParam sampling_param;
+  sampling_param.logprobs = true;
+  StoppingChecker stopping_checker;
+  stopping_checker.set_max_generated_tokens(3);
+  RequestState request_state(
+      /*prompt=*/"",
+      std::vector<int32_t>{1},
+      sampling_param,
+      SchedulerParam{},
+      stopping_checker,
+      /*seq_capacity=*/8,
+      /*n=*/1,
+      /*best_of=*/1,
+      /*logprobs=*/true,
+      /*stream=*/false,
+      /*echo=*/false,
+      /*skip_special_tokens=*/true,
+      /*enable_schedule_overlap=*/false,
+      [](const RequestOutput&) { return true; },
+      OutputsFunc{});
+  request_state.rec_type = RecType::kOneRec;
+  Request request("beam-score", "", "", request_state);
+  auto* seq = request.sequences()[0].get();
+  const std::vector<std::vector<float>> scores = {{-2.f, -3.25f, -3.5f},
+                                                  {-1.f, -2.25f, -3.25f}};
+  seq->set_beam_result(/*bw=*/2,
+                       /*total_rounds=*/3,
+                       {{11, 12, 13}, {21, 22, 23}},
+                       {-3.5f, -3.25f},
+                       scores);
+  const RequestOutput output = request.generate_output(tokenizer);
+  ASSERT_EQ(output.outputs.size(), 2);
+  EXPECT_EQ(output.outputs[0].token_ids, (std::vector<int32_t>{21, 22, 23}));
+  EXPECT_EQ(output.outputs[1].token_ids, (std::vector<int32_t>{11, 12, 13}));
+  for (size_t row = 0; row < 2; ++row) {
+    ASSERT_EQ(output.outputs[row].token_ids_logprobs.size(), 3);
+    for (size_t column = 0; column < 3; ++column) {
+      EXPECT_EQ(output.outputs[row].token_ids_logprobs[column],
+                scores[1 - row][column]);
+    }
+  }
+  ASSERT_TRUE(output.outputs[0].logprobs.has_value());
+  ASSERT_EQ(output.outputs[0].logprobs->size(), 1);
+  EXPECT_EQ(output.outputs[0].logprobs->front().logprob, -3.25f);
 }
 
 }  // namespace

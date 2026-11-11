@@ -18,9 +18,8 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
-#include <algorithm>
 #include <cstdint>
-#include <limits>
+#include <utility>
 #include <vector>
 
 namespace xllm::runtime::detail {
@@ -94,15 +93,14 @@ inline void write_first_round_beam_outputs(
 }
 
 // Parent indices are global rows in the previous [batch * beam] tensor.
-// Reorder the full history before appending the selected token's conditional
-// logprob; output scores from beam search are cumulative, not per-token.
-inline void write_beam_round_step_logprobs(
-    const torch::Tensor& out_log_probs,
-    const torch::Tensor& previous_acc_logprobs,
-    const torch::Tensor& parent_indices,
-    int32_t batch_size,
-    int32_t round,
-    torch::Tensor& token_step_logprobs) {
+// Reorder the full history before appending this round's score. Always
+// copy the cumulative beam score directly to preserve the SKU output contract
+// and avoid a difference-then-sum floating-point round trip.
+inline void write_beam_round_step_logprobs(const torch::Tensor& out_log_probs,
+                                           const torch::Tensor& parent_indices,
+                                           int32_t batch_size,
+                                           int32_t round,
+                                           torch::Tensor& token_step_logprobs) {
   if (!token_step_logprobs.defined()) {
     return;
   }
@@ -116,7 +114,7 @@ inline void write_beam_round_step_logprobs(
   CHECK_LT(round, token_step_logprobs.size(2));
   const int64_t result_width = out_log_probs.size(0) / batch_size;
   const int64_t total_rounds = token_step_logprobs.size(2);
-  auto scores = out_log_probs.reshape({batch_size, result_width});
+  const auto scores = out_log_probs.reshape({batch_size, result_width});
   if (round == 0) {
     token_step_logprobs = torch::zeros({batch_size, result_width, total_rounds},
                                        token_step_logprobs.options());
@@ -124,22 +122,11 @@ inline void write_beam_round_step_logprobs(
     return;
   }
   CHECK_EQ(parent_indices.numel(), out_log_probs.numel());
-  CHECK_EQ(previous_acc_logprobs.numel(),
-           batch_size * token_step_logprobs.size(1));
   const auto parents = parent_indices.reshape({-1}).to(torch::kInt64);
   auto history = token_step_logprobs.reshape({-1, total_rounds})
                      .index_select(0, parents)
                      .reshape({batch_size, result_width, total_rounds});
-  const auto parent_scores = previous_acc_logprobs.reshape({-1})
-                                 .index_select(0, parents)
-                                 .reshape({batch_size, result_width});
-  // A masked parent may have -inf cumulative probability. Keep its children
-  // invalid instead of producing NaN from -inf - -inf.
-  const auto conditional_scores = torch::where(
-      torch::isfinite(parent_scores),
-      scores - parent_scores,
-      torch::full_like(scores, -std::numeric_limits<float>::infinity()));
-  history.select(2, round).copy_(conditional_scores);
+  history.select(2, round).copy_(scores);
   token_step_logprobs = std::move(history);
 }
 

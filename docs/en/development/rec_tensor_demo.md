@@ -79,6 +79,15 @@ DEMO=build/xllm/test_query_rec_input_tensors
 ```
 
 `--convert-items 1` tests dictionary conversion and aligned item metadata.
+For the multi-round beam output exercised here, `sku_logprobs` and structured
+`rec_token_logprobs` contain cumulative prefix scores along the selected parent
+path; the last column holds the final beam score. A selectable per-token mode
+for this path is deferred. The separate non-beam OneRec output path retains
+v0.9's individual token scores, so its last column is not a sequence total.
+The v0.9 historical parent misalignment remains fixed. Beam score golden files
+from earlier migration binaries contain per-token scores and cannot be compared
+directly; regenerate them after validating the cumulative beam score contract.
+
 Use the same model, dictionary, inputs and sampling configuration for saved
 output comparisons. A graph/eager mismatch needs numerical investigation;
 this demo deliberately reports it rather than applying an implicit tolerance.

@@ -28,7 +28,7 @@ extern "C" {
 #define XLLM_META_STRING_FIELD_MAX_LEN 128
 
 // Major version of the public C ABI. A mismatch requires recompilation.
-#define XLLM_C_ABI_VERSION_MAJOR 2
+#define XLLM_C_ABI_VERSION_MAJOR 1
 
 // Export Macro Definition
 #ifndef XLLM_CAPI_EXPORT
@@ -199,7 +199,7 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
   /** Whether to convert token ids to item ids in REC response */
   bool enable_convert_tokens_to_item;
 
-  /** Whether to output token-aligned logprobs tensor in REC response */
+  /** Whether to output token-aligned REC logprobs */
   bool enable_output_sku_logprobs;
 
   /** Whether to enable extended item info parsing and output tensors */
@@ -495,7 +495,8 @@ typedef struct XLLM_CAPI_EXPORT XLLM_RecOutput {
   /** Number of item ids in the item_ids array */
   size_t item_ids_size;
 
-  /** Token-aligned REC/OneRec logprobs for this choice */
+  /** Token-aligned REC scores: cumulative prefixes for multi-round beam
+   * output, per-token conditional scores for non-beam OneRec output. */
   float* rec_token_logprobs;
 
   /** Number of entries in rec_token_logprobs */

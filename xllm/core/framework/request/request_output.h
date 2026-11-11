@@ -76,7 +76,8 @@ struct SequenceOutput {
   // log probabilities of the generated tokens.
   std::optional<std::vector<LogProb>> logprobs;
 
-  // token-aligned logprobs for REC / OneRec outputs.
+  // Token-aligned REC scores: cumulative prefixes for multi-round beam output,
+  // per-token conditional scores for non-beam OneRec output.
   std::vector<std::optional<float>> token_ids_logprobs;
 
   // the embeddings of the prompt token

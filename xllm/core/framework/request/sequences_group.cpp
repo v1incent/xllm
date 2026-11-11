@@ -467,7 +467,7 @@ void SequencesGroup::generate_multi_round_output(
     rank.emplace_back(lp, b);
   }
   std::sort(rank.begin(), rank.end(), [](const auto& l, const auto& r) {
-    return l.first != r.first ? l.first > r.first : l.second < r.second;
+    return l.first > r.first;
   });
 
   const auto& flat2d = base.beam_seq_group_flat();

@@ -538,6 +538,11 @@ class ExtBuild(build_ext):
             os.path.join(extdir, product),
             server_output_dir,
         )
+        if self.generate_so:
+            shutil.copy(
+                os.path.join(cmake_dir, "mooncake-common", "libasio.so"),
+                server_output_dir,
+            )
         if self.enable_ha:
             etcd_wrapper = os.path.join(extdir, "libetcd_wrapper.so")
             if not os.path.isfile(etcd_wrapper):

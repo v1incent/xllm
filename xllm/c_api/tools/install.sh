@@ -17,6 +17,7 @@ LOCAL_TARGET_DIR="${LOCAL_INSTALL_DIR}/xllm"
 HEADERS=("${SCRIPT_DIR}/../llm.h" "${SCRIPT_DIR}/../rec.h" "${SCRIPT_DIR}/../default.h" "${SCRIPT_DIR}/../types.h")
 SO_FILES=(
     "${SCRIPT_DIR}/../../../build/xllm/core/server/libxllm.so"
+    "${SCRIPT_DIR}/../../../build/xllm/core/server/libasio.so"
 )
 
 error_exit() {

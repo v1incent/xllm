@@ -46,6 +46,38 @@ You will see the following files in /usr/local/xllm directory:
 3 directories, 5 files
 ```
 
+### How to package NPU custom operators
+
+After building and installing the custom operators that match your xLLM library,
+run the following command from the repository root:
+
+```bash
+VENDORS_DIR=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors \
+  DEVICE=a3 bash xllm/c_api/tools/pack_vendors.sh
+```
+
+The script copies `config.ini` and the complete `custom_xllm_math` directory into
+`bin/vendors-<version>-<commit_id>-<arch>-<device>-bare.tar.gz`.
+`version` comes from `version.txt`, and `commit_id` comes from the main xLLM
+repository's current HEAD, not the operator submodule. These labels do not verify
+the version of the installed operators.
+
+`VENDORS_DIR` defaults to `opp/vendors` under `ASCEND_HOME_PATH`, then
+`NPU_HOME_PATH`, then `/usr/local/Ascend/ascend-toolkit/latest`. `ARCH` is detected
+as `arm` or `x86` unless explicitly set; `DEVICE` defaults to `a3`.
+
+The archive has the following layout:
+
+```text
+config.ini
+custom_xllm_math/
+```
+
+This bare archive is intended for extraction directly into the target OPP
+`vendors` directory. Installers that expect an outer `vendors/` directory need
+to handle this layout explicitly. The source `config.ini` is copied unchanged;
+any other vendors referenced by it must be available in the target environment.
+
 ### How to compile c_api examples
 
 GPU builds and NPU builds use different link commands. Replace

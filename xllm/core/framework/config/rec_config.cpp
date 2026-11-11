@@ -57,7 +57,9 @@ DEFINE_bool(enable_convert_tokens_to_item,
 
 DEFINE_bool(enable_output_sku_logprobs,
             false,
-            "Enable REC / OneRec token-aligned logprobs tensor output.");
+            "Enable REC / OneRec token-aligned logprobs output "
+            "(cumulative for multi-round beam output, per-token for non-beam "
+            "OneRec output).");
 
 DEFINE_bool(enable_extended_item_info,
             false,

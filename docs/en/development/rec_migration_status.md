@@ -40,9 +40,9 @@ relationship to the migrated release is unverified.
   Split head indices must be contiguous, with offsets inferred from weights.
 - Width-one multi-round decoding; the first round creates exactly BW parents.
   Batched first-round output preserves separate request/beam rows.
-  Per-token logprobs follow the selected parent history, including repeated
-  parents and final output widths different from BW. Invalid parent scores do
-  not produce NaN from infinity subtraction.
+  SKU scores follow the selected parent history, including repeated parents
+  and final output widths different from BW. Each column contains the cumulative
+  prefix score; masked scores remain negative infinity without subtraction.
 - Single-step `vocab_probs` output keeps FP32 sampler probabilities after
   filtering, temperature, top-k and top-p. A split first head returns only its
   first segment. Item conversion samples dictionary entries before copying,
@@ -67,6 +67,55 @@ block size 128. Unsupported values fail model initialization. The fused
 constrained Top-K path remains opt-in through
 `XLLM_ENABLE_ONEREC_FUSED_CONSTRAINED_TOPK` because model comparison found
 different ordering for tied scores (see below).
+
+## Score compatibility follow-up — November 11, 2026
+
+The score compatibility follow-up on `e6d0200c` preserves v0.9 behavior by
+output path. The existing `sku_logprobs` tensor and structured
+`rec_token_logprobs` do not have one uniform score meaning:
+
+| Output path | v0.9 semantics retained by the migration |
+| --- | --- |
+| Multi-round beam history (`write_beam_round_step_logprobs`) | Cumulative prefix score for each round; the last column is the final beam score. |
+| Non-beam OneRec (`Sequence::generate_onerec_output`) | Individual token logprob copied from `LogprobState`; a missing score leaves only that token unknown. |
+
+Multi-round workers copy cumulative beam scores directly without subtracting
+and summing again. Histories follow selected parents, including repeated
+parents and changes in beam width. Output rows follow the final ranking and
+item conversion. v0.9's earlier history columns could belong to a different
+beam; that parent-history bug remains fixed. Compare earlier columns using
+matched token paths rather than requiring equality with misaligned v0.9 rows.
+
+The original v0.9 `xllm/core/framework/request/sample_slot_test.cpp` checks
+non-beam OneRec scores `[-0.1, -0.2, -0.3]`. Accumulating them to
+`[-0.1, -0.3, -0.6]` changes that path's legacy behavior. The initial
+compatibility patch incorrectly made that conversion; this correction removes
+it and restores the original test expectations. Its missing-score regression
+now uses the decoder prefix length to locate the second generated token and
+expects `[-0.1, nullopt, -0.3]`.
+
+A selectable per-token mode for multi-round beam output is deferred. The
+existing non-beam per-token behavior remains available on its original path.
+No score-mode flag, JSON option, C API function or demo option is added.
+Output still requires `enable_output_sku_logprobs=true`; public C struct
+layouts, ABI major 2 and beam ranking are unchanged.
+
+Earlier migration binaries returned per-token scores for multi-round beam
+history. Their beam score golden files cannot be reused directly as cumulative
+score golden files. Summing those values need not reproduce cumulative FP32
+scores bit for bit; regenerate them after validating the beam score contract.
+
+Local validation of the beam change used actual CPU Torch, glog and GoogleTest
+on macOS: all six `rec_beam_utils_test` cases passed, covering parent reordering,
+batch separation, widening/narrowing, an FP32 cancellation boundary, disabled
+collection, width one and masked parents. The beam implementation and those
+tests are unchanged by the non-beam correction. The public C header and REC
+configuration implementation passed syntax checks. The non-beam export block
+was compared directly with the v0.9 source. Request and raw/structured C API
+integration tests have not run locally because generated protobuf headers and
+full project dependencies are unavailable. Full CANN 9 builds, NPU execution
+and predictor AB remain required; earlier validation below does not cover
+these score compatibility changes.
 
 ## Dictionary sampling follow-up — November 10, 2026
 

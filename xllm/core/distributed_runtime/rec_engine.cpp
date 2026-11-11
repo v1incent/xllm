@@ -216,8 +216,8 @@ KVCacheCapacity RecEngine::estimate_kv_cache_capacity() {
   CHECK_GT(kv_cache_cap.cache_size_in_bytes(), 0)
       << "Available kv cache size must be greater than 0";
 
-  kv_cache_cap.n_blocks() = kv_cache_cap.cache_size_in_bytes() /
-                            (args_.n_layers() * block_size_in_bytes);
+  kv_cache_cap.n_blocks() =
+      kv_cache_cap.cache_size_in_bytes() / cache_block_size_in_bytes;
   CHECK_GT(kv_cache_cap.n_blocks(), 0) << "no n_blocks for kv cache";
 
   return kv_cache_cap;
