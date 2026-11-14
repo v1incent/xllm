@@ -40,6 +40,9 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/rec_config.h"
+#if defined(USE_NPU)
+#include "operations/aclnn/core/acl_nn_operation.h"
+#endif
 #include "core/runtime/rec_beam_utils.h"
 #include "core/runtime/rec_worker_impl.h"
 #include "core/util/scope_guard.h"
@@ -3436,6 +3439,13 @@ RecWorkerImpl::RecWorkerImpl(const ParallelArgs& parallel_args,
                              const torch::Device& device,
                              const runtime::Options& options)
     : LLMWorkerImpl(parallel_args, device, options) {
+#if defined(USE_NPU)
+  if (RecConfig::get_instance().enable_multistream_perf_mode()) {
+    // Pair the removal of host serialization with ACLNN executor isolation.
+    // Initialize in each worker process before models create their operations.
+    atb_speed::common::EnableAclNNThreadLocalCache();
+  }
+#endif
   initialize_xattention_workspace();
 
   if (!is_driver()) {

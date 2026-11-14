@@ -367,3 +367,86 @@ Commands, exit codes, original failed-attempt logs and artifact SHA256 hashes
 are retained under the validation directory's `evidence/` subdirectory.
 The published migration source and both dependency pins were unchanged by
 these environment and build-directory adjustments.
+
+
+## ACLNN cache migration repair — November 14, 2026
+
+The migration checklist missed the ACLNN cache/executor isolation and lifetime
+changes from `release/v0.9.0`. The source ATB commit `ea1d4042` contains them;
+in migration ATB `e2e85fac`, the nine affected core/cache/singleton files still
+match the 0.11 baseline `dac7607d`. The original integration work covered model
+and operator changes without bringing over this concurrency support.
+
+The local repair, based on parent `eea3a163` and ATB `e2e85fac`, restores:
+
+- Device-scoped cache and executor-manager instances, with synchronized global
+  cache and reference-count maps.
+- Idempotent operation destruction so derived/base destructors release a shared
+  executor reference only once.
+- Per-operation caches with device/thread ownership checks when isolation is
+  enabled. A cache retains its manager until teardown, including teardown after
+  the creator thread exits. Reuse checks both the thread ID and manager identity
+  because the operating system can recycle thread IDs. A regression failed with
+  the ID-only check and passed after the identity check was added.
+- REC worker initialization enabling isolation before model initialization when
+  `enable_multistream_perf_mode` is enabled. This uses a monotonic process-wide
+  request, allowing late REC initialization after another model has already used
+  ACLNN, without modifying environment variables while worker threads run.
+
+The repair retains the current migration's non-repeatable executor ownership,
+ABA reference-count reset, auxiliary tensor cleanup and null tensor-list guards.
+It does not replace the current implementation wholesale with the 0.9 files.
+No C API field or configuration default changes.
+
+### Activation and limits
+
+With REC multistream performance mode enabled, each REC worker process enables
+isolation automatically. In ordinary mode, set the following before starting
+the process to request the same isolation independently:
+
+```sh
+export XLLM_ATB_ACLNN_THREAD_LOCAL_CACHE=1
+```
+
+The environment value is read once. The programmatic request is process-wide
+and cannot be disabled until process restart. Existing caches are retired on a
+subsequent `Setup`; registration and destruction use the manager recorded for
+that cache even if isolation is enabled during initialization.
+
+When both switches are off, operations still share global caches within each
+device. Map mutexes do not serialize the complete tensor-address-update and
+execution-submission sequence. This repair also does not make concurrent calls
+to the same operation instance safe; the caller must keep that instance's
+`Setup`/`Execute`/destruction ordered. Consequently the default mode must not be
+presented as eliminating every shared-executor concurrency risk.
+
+### Validation of this repair
+
+The standalone suite under
+`third_party/xllm_atb_layers/tests/aclnn_cache` compiles the production operation,
+cache, manager and tensor-comparison sources with private SDK test doubles.
+All **8/8 cases passed under ASan/UBSan and 8/8 under TSan**, covering legacy
+sharing/destruction, device isolation, operation/thread ownership, concurrent
+address separation, late enablement, non-repeatable executor cleanup, reference
+counting/ABA and global cache map concurrency. These are host ownership tests;
+they do not initialize an NPU or establish CANN kernel correctness.
+
+On 99 in container `xllm-npu-zhanghe209`, the four changed ACLNN `.cpp` files and
+`rec_worker_impl.cpp` passed ARM64 object compilation with the existing CANN 9
+build configuration. The final thread-owner change was recompiled and source
+hashes were checked. All compiler outputs went to a separate temporary directory.
+This is **five translation units compiled**, not a complete library link or
+model test. Test logs, compiler results and the patch manifest are retained in
+`/private/tmp/joycode-aclnn-fix-si7dgl13` on the development Mac; remote compile
+outputs are in `/tmp/joycode-aclnn-fix-si7dgl13` inside that container.
+
+The ATB repair is committed locally as
+`e55cdcb851e9b99a01caa66d3956bc260d5ddb5a`. The parent records this submodule
+pin together with the host integration and this status update. The dependency
+pins in the earlier sections identify historical migration checkpoints; these
+new commits have not been pushed. Before packaging, rebuild all consumers of
+the changed ATB headers. A complete link, actual
+NPU/predictor concurrency and teardown regressions, and reproduction of the
+reported core remain outstanding. The observed shared caches are a plausible
+crash mechanism; this repair does not establish the exact cause of the core.
+No library deployment or service restart was performed for this repair.
