@@ -28,7 +28,6 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/quant_args.h"
-#include "framework/parallel_state/parallel_args.h"
 
 namespace xllm {
 
@@ -61,6 +60,8 @@ class ModelContext {
                const torch::TensorOptions& tensor_options);
 
 #if defined(USE_NPU)
+  // Borrows an externally managed ATB context. The caller must keep it alive
+  // until this context and all of its consumers have been destroyed.
   ModelContext(const ParallelArgs& input_parallel_args,
                const ModelArgs& model_args,
                const QuantArgs& quant_args,
@@ -95,7 +96,10 @@ class ModelContext {
   ModelContext with_quant_args(const QuantArgs& quant_args) const;
 
 #if defined(USE_NPU)
-  const atb::Context* get_atb_context() const { return context_; }
+  const atb::Context* get_atb_context() const { return context_.get(); }
+  const std::shared_ptr<atb::Context>& get_atb_context_handle() const {
+    return context_;
+  }
   std::shared_ptr<AtbWorkspace> get_atb_workspace() const {
     return atb_workspace_;
   }
@@ -128,8 +132,9 @@ class ModelContext {
   FlashComm1Options flash_comm1_options_;
 
 #if defined(USE_NPU)
-  // used for npu atb
-  atb::Context* context_;
+  // Copies and derived contexts share ownership; borrowed contexts use a
+  // non-owning handle. Keep the context alive until workspace teardown ends.
+  std::shared_ptr<atb::Context> context_;
   std::shared_ptr<AtbWorkspace> atb_workspace_;
 #endif
 };

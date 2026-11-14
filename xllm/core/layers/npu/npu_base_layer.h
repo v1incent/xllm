@@ -215,6 +215,9 @@ class BaseLayer : public torch::nn::Module {
   virtual void set_layer_id(int32_t layer_id) {};
 
  protected:
+  // Registered torch submodules can outlive the parent ModelContext member.
+  // Retain the ATB context until this layer's operations and loaders are gone.
+  std::shared_ptr<atb::Context> context_handle_;
   std::unique_ptr<BaseLoader> loader_ = nullptr;
   std::vector<at::Tensor> at_weight_tensors_;
   at::Device device_;

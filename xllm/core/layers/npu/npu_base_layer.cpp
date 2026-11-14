@@ -29,7 +29,8 @@ namespace xllm {
 namespace layer {
 
 BaseLayer::BaseLayer(const ModelContext& context)
-    : device_(context.get_tensor_options().device()),
+    : context_handle_(context.get_atb_context_handle()),
+      device_(context.get_tensor_options().device()),
       name_(""),
       parallel_args_(context.get_parallel_args()) {
   auto quant_args = context.get_quant_args();

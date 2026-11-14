@@ -81,9 +81,11 @@ class RecWorkerImpl : public LLMWorkerImpl {
       expert_load_data = std::move(other.expert_load_data);
     }
     std::unique_ptr<Stream> stream;
+    // Destruction runs in reverse: executors and models must finish before
+    // their ATB context, and the stream must remain valid through teardown.
+    std::unique_ptr<ModelContext> context;
     std::unique_ptr<CausalLM> model;
     std::unique_ptr<Executor> executor;
-    std::unique_ptr<ModelContext> context;
     std::unique_ptr<EplbExecutor> eplb_executor;
     torch::Tensor expert_load_data;
 

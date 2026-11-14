@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "core/framework/model_context.h"
 
+#include <glog/logging.h>
 #include <torch/torch.h>
 
 #include "common/global_flags.h"
@@ -37,6 +38,42 @@ namespace xllm {
 
 namespace {
 
+#if defined(USE_NPU)
+void destroy_atb_context(atb::Context* context,
+                         aclrtContext runtime_context) noexcept {
+  if (context == nullptr) {
+    return;
+  }
+  aclrtContext previous_context = nullptr;
+  const aclError get_status = aclrtGetCurrentContext(&previous_context);
+  const bool switch_context =
+      get_status != ACL_SUCCESS || previous_context != runtime_context;
+  if (switch_context) {
+    const aclError status = aclrtSetCurrentContext(runtime_context);
+    if (status != ACL_SUCCESS) {
+      LOG(ERROR) << "Failed to bind runtime context for ATB context teardown: "
+                 << status;
+      return;
+    }
+  }
+
+  const atb::Status status = atb::DestroyContext(context);
+  if (status != atb::NO_ERROR) {
+    LOG(ERROR) << "Failed to destroy ATB context: " << status;
+  }
+  // A teardown thread may not have had a runtime context. Restore an existing
+  // one without resetting a device or invalidating other live model contexts.
+  if (switch_context && get_status == ACL_SUCCESS &&
+      previous_context != nullptr) {
+    const aclError restore_status = aclrtSetCurrentContext(previous_context);
+    if (restore_status != ACL_SUCCESS) {
+      LOG(ERROR) << "Failed to restore runtime context after ATB teardown: "
+                 << restore_status;
+    }
+  }
+}
+#endif
+
 bool should_enable_async_tiling_copy_stream() {
   // ATB copy-stream teardown is not reversible for the same context on the
   // current CANN/PTA stack, so contexts that may enter graph capture must not
@@ -58,13 +95,23 @@ ModelContext::ModelContext(const ParallelArgs& input_parallel_args,
       quant_args_(quant_args),
       tensor_options_(tensor_options) {
 #if defined(USE_NPU)
-  int32_t device_id = tensor_options.device().index();
-  aclError ret = aclrtSetDevice(device_id);
-  atb::CreateContext(&context_);
+  const int32_t device_id = tensor_options.device().index();
+  CHECK_EQ(aclrtSetDevice(device_id), ACL_SUCCESS);
+  aclrtContext runtime_context = nullptr;
+  CHECK_EQ(aclrtGetCurrentContext(&runtime_context), ACL_SUCCESS);
+  CHECK(runtime_context != nullptr);
+  atb::Context* context = nullptr;
+  const atb::Status create_status = atb::CreateContext(&context);
+  context_ = std::shared_ptr<atb::Context>(
+      context, [runtime_context](atb::Context* owned_context) {
+        destroy_atb_context(owned_context, runtime_context);
+      });
+  CHECK_EQ(create_status, atb::NO_ERROR);
+  CHECK(context_ != nullptr);
   void* stream = c10_npu::getCurrentNPUStream(device_id).stream();
-  context_->SetExecuteStream(stream);
+  CHECK_EQ(context_->SetExecuteStream(stream), atb::NO_ERROR);
   if (should_enable_async_tiling_copy_stream()) {
-    context_->SetAsyncTilingCopyStatus(true);
+    CHECK_EQ(context_->SetAsyncTilingCopyStatus(true), atb::NO_ERROR);
   }
   atb_workspace_ = std::make_shared<AtbWorkspace>(tensor_options.device());
 #endif
@@ -81,14 +128,15 @@ ModelContext::ModelContext(const ParallelArgs& input_parallel_args,
       model_args_(model_args),
       quant_args_(quant_args),
       tensor_options_(tensor_options),
-      context_(context) {}
+      context_(context, [](atb::Context* /*borrowed_context*/) {}) {}
 #endif
 
 ModelContext ModelContext::with_parallel_args(
     const ParallelArgs& parallel_args) const {
 #if defined(USE_NPU)
   ModelContext derived(
-      parallel_args, model_args_, quant_args_, tensor_options_, context_);
+      parallel_args, model_args_, quant_args_, tensor_options_, context_.get());
+  derived.context_ = context_;
   derived.atb_workspace_ = atb_workspace_;
 #else
   ModelContext derived(
@@ -103,7 +151,8 @@ ModelContext ModelContext::with_parallel_args(
 ModelContext ModelContext::with_quant_args(const QuantArgs& quant_args) const {
 #if defined(USE_NPU)
   ModelContext derived(
-      parallel_args_, model_args_, quant_args, tensor_options_, context_);
+      parallel_args_, model_args_, quant_args, tensor_options_, context_.get());
+  derived.context_ = context_;
   derived.atb_workspace_ = atb_workspace_;
 #else
   ModelContext derived(
