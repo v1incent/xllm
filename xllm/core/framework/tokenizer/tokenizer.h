@@ -25,6 +25,8 @@ limitations under the License.
 
 namespace xllm {
 
+struct RecItemInfo;
+
 class Tokenizer {
  public:
   virtual ~Tokenizer() = default;
@@ -67,6 +69,13 @@ class Tokenizer {
   virtual bool decode(const Slice<int32_t>& token_ids,
                       bool skip_special_tokens,
                       std::vector<int64_t>* item_ids) const {
+    return false;
+  }
+
+  // Decode recommendation items with did/type metadata when supported.
+  virtual bool decode_item_infos(
+      const Slice<int32_t>& /*token_ids*/,
+      std::vector<RecItemInfo>* /*item_infos*/) const {
     return false;
   }
 

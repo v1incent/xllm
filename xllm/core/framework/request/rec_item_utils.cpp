@@ -19,7 +19,6 @@ limitations under the License.
 #include "core/framework/config/rec_config.h"
 #include "core/framework/request/rec_type.h"
 #include "core/framework/request/request_output.h"
-#include "core/framework/tokenizer/rec_tokenizer.h"
 #include "core/framework/tokenizer/tokenizer.h"
 
 namespace xllm {
@@ -34,7 +33,6 @@ void decode_rec_items(const Tokenizer& tokenizer,
     return;
   }
   const bool extended = config.enable_extended_item_info();
-  const auto* rec_tokenizer = dynamic_cast<const RecTokenizer*>(&tokenizer);
   std::vector<RecItemInfo> candidates;
   candidates.reserve(output.token_ids.size() / kItemTokenCount);
   for (size_t offset = 0; offset < output.token_ids.size();
@@ -42,8 +40,8 @@ void decode_rec_items(const Tokenizer& tokenizer,
     const Slice<int32_t> tokens(output.token_ids.data() + offset,
                                 kItemTokenCount);
     std::vector<RecItemInfo> infos;
-    if (extended && rec_tokenizer != nullptr &&
-        rec_tokenizer->decode_item_infos(tokens, &infos) && !infos.empty()) {
+    if (extended && tokenizer.decode_item_infos(tokens, &infos) &&
+        !infos.empty()) {
       candidates.insert(candidates.end(), infos.begin(), infos.end());
       continue;
     }

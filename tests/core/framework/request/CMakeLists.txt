@@ -160,3 +160,12 @@ cc_test(
   SRCS rec_item_utils_test.cpp
   DEPS GTest::gtest_main
 )
+
+cc_test(
+  NAME rec_item_decode_test
+  NO_NPU_INIT
+  SRCS
+    rec_item_decode_test.cpp
+    ${PROJECT_SOURCE_DIR}/xllm/core/framework/request/rec_item_utils.cpp
+  DEPS :config :tokenizer GTest::gtest_main
+)
