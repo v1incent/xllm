@@ -127,6 +127,7 @@ class NpuOneRecBlockLayerImpl final : public BaseLayer {
                                      const std::string& name,
                                      const torch::Tensor& tensor);
   void merge_experts_weights();
+  void release_expert_weight_staging();
   void merge_shared_experts_weights();
   bool validate_decoder_moe_weights(const std::string& prefix) const;
   torch::Tensor merge_experts_weights(std::vector<torch::Tensor>& experts,
