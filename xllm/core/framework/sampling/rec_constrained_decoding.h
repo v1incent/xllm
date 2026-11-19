@@ -17,6 +17,8 @@ limitations under the License.
 #include <torch/torch.h>
 #include <torch/types.h>
 
+#include <memory>
+
 #include "constrained_decoding.h"
 #include "util/threadpool.h"
 
@@ -26,7 +28,7 @@ class RecVocabDict;
 
 class RecConstrainedDecoding : public ConstrainedDecoding {
  public:
-  RecConstrainedDecoding(RecVocabDict* vocab_dict,
+  RecConstrainedDecoding(std::shared_ptr<const RecVocabDict> vocab_dict,
                          const int32_t vocab_size,
                          torch::ScalarType dtype,
                          torch::Device device,
@@ -50,7 +52,7 @@ class RecConstrainedDecoding : public ConstrainedDecoding {
   bool build_mask_cache_;
   bool use_gen_threadpool_;
   int32_t vocab_size_;
-  RecVocabDict* vocab_dict_ = nullptr;
+  std::shared_ptr<const RecVocabDict> vocab_dict_;
   torch::Device device_;
   torch::ScalarType dtype_;
   torch::Tensor first_token_mask_;

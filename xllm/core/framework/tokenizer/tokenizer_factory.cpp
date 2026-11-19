@@ -22,7 +22,8 @@ namespace xllm {
 std::unique_ptr<Tokenizer> TokenizerFactory::create_tokenizer(
     const std::string& model_weights_path,
     TokenizerArgs tokenizer_args,
-    bool proxy) {
+    bool proxy,
+    std::shared_ptr<const RecVocabDict> rec_vocab_dict) {
   std::unique_ptr<Tokenizer> tokenizer;
   if (tokenizer_args.tokenizer_type() == "rwkv") {
     LOG(INFO) << "Create RWKV trie tokenizer.";
@@ -41,8 +42,8 @@ std::unique_ptr<Tokenizer> TokenizerFactory::create_tokenizer(
   } else if (tokenizer_args.tokenizer_type() == "rec") {
     // 3. create rec tokenizer
     LOG(INFO) << "Create rec tokenizer.";
-    tokenizer =
-        std::make_unique<RecTokenizer>(model_weights_path, tokenizer_args);
+    tokenizer = std::make_unique<RecTokenizer>(
+        model_weights_path, tokenizer_args, std::move(rec_vocab_dict));
   } else {
     // 4. create sentencepiece tokenizer
     LOG(INFO) << "Create SentencePiece tokenizer.";

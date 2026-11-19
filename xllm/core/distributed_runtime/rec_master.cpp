@@ -716,8 +716,11 @@ std::unique_ptr<RecMaster::RecMasterPipeline> RecMaster::create_pipeline(
   }
 }
 
-RecMaster::RecMaster(const Options& options)
+RecMaster::RecMaster(const Options& options,
+                     std::shared_ptr<const RecVocabDict> rec_vocab_dict)
     : Master(options, EngineType::REC) {
+  static_cast<RecEngine*>(engine_.get())
+      ->set_rec_vocab_dict(std::move(rec_vocab_dict));
   // Initialize with Rec engine type
   // The rest of the initialization follows the same pattern as LLMMaster
   CHECK(engine_->init());

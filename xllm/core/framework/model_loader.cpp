@@ -30,23 +30,17 @@ limitations under the License.
 namespace xllm {
 
 std::unique_ptr<ModelLoader> ModelLoader::create(
-    const std::string& model_weights_path) {
-  ModelType model_type;
+    const std::string& model_weights_path,
+    std::shared_ptr<const RecVocabDict> rec_vocab_dict) {
   for (const auto& entry :
        std::filesystem::directory_iterator(model_weights_path)) {
     if (entry.path().extension() == ".safetensors" ||
         entry.path().extension() == ".bin") {
-      model_type = ModelType::HF_MODEL_TYPE;
-      break;
+      return std::make_unique<HFModelLoader>(model_weights_path,
+                                             std::move(rec_vocab_dict));
     }
   }
-
-  if (model_type == ModelType::HF_MODEL_TYPE) {
-    return std::make_unique<HFModelLoader>(model_weights_path);
-  } else {
-    LOG(FATAL) << "Only support HF model type currently.";
-  }
-
+  LOG(FATAL) << "Only support HF model type currently.";
   return nullptr;
 }
 

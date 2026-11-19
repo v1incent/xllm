@@ -44,6 +44,8 @@ class Worker {
 
   ~Worker();
 
+  void set_rec_vocab_dict(std::shared_ptr<const RecVocabDict> rec_vocab_dict);
+
   // initialize model, cache manager. blocking call
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
@@ -134,7 +136,7 @@ class Worker {
       Slice<BlockTransferInfo>& block_transfer_info);
 
   // Run the model on the given input. async call
-  // the future returns a successfull status with no meaningful value
+  // the future returns a successful status with no meaningful value
   folly::SemiFuture<std::optional<ForwardOutput>> step_async(
       const ForwardInput& inputs);
 

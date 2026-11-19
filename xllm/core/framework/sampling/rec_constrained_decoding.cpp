@@ -25,6 +25,7 @@ limitations under the License.
 #include <fstream>
 #include <future>
 #include <mutex>
+#include <utility>
 
 #include "common/global_flags.h"
 #include "framework/state_dict/rec_vocab_dict.h"
@@ -32,14 +33,15 @@ limitations under the License.
 #include "util/tensor_helper.h"
 
 namespace xllm {
-RecConstrainedDecoding::RecConstrainedDecoding(RecVocabDict* vocab_dict,
-                                               const int32_t vocab_size,
-                                               torch::ScalarType dtype,
-                                               torch::Device device,
-                                               bool use_gen_threadpool)
+RecConstrainedDecoding::RecConstrainedDecoding(
+    std::shared_ptr<const RecVocabDict> vocab_dict,
+    const int32_t vocab_size,
+    torch::ScalarType dtype,
+    torch::Device device,
+    bool use_gen_threadpool)
     : use_gen_threadpool_(use_gen_threadpool),
       vocab_size_(vocab_size),
-      vocab_dict_(vocab_dict),
+      vocab_dict_(std::move(vocab_dict)),
       device_(device),
       dtype_(dtype) {
   if (use_gen_threadpool_) {

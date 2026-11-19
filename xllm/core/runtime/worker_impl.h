@@ -52,6 +52,7 @@ limitations under the License.
 namespace xllm {
 
 class WorkerRendezvous;
+class RecVocabDict;
 
 class WorkerImpl {
  public:
@@ -152,6 +153,8 @@ class WorkerImpl {
   void sanitize_json_object_error_inputs(ForwardInput& inputs);
 
   // initialize model, cache manager. async call
+  void set_rec_vocab_dict(std::shared_ptr<const RecVocabDict> rec_vocab_dict);
+
   virtual folly::SemiFuture<bool> init_model_async(
       const std::string& model_weights_path,
       int32_t random_seed,
@@ -205,7 +208,7 @@ class WorkerImpl {
       Slice<BlockTransferInfo>& block_transfer_info);
 
   // Run the model on the given input. async call
-  // the future returns a successfull status with no meaningful value
+  // the future returns a successful status with no meaningful value
   virtual folly::SemiFuture<std::optional<ForwardOutput>> step_async(
       const ForwardInput& inputs);
 
@@ -414,6 +417,7 @@ class WorkerImpl {
   torch::Tensor expert_load_data_;
 
   std::string model_weights_path_;
+  std::shared_ptr<const RecVocabDict> rec_vocab_dict_;
 };
 
 }  // namespace xllm

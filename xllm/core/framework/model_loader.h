@@ -28,6 +28,8 @@ limitations under the License.
 
 namespace xllm {
 
+class RecVocabDict;
+
 class ModelLoader {
  public:
   enum ModelType : uint8_t { HF_MODEL_TYPE = 0, INVALID = 1 };
@@ -38,6 +40,9 @@ class ModelLoader {
   virtual const QuantArgs& quant_args() const { return quant_args_; }
   virtual const TokenizerArgs& tokenizer_args() const {
     return tokenizer_args_;
+  }
+  virtual std::shared_ptr<const RecVocabDict> rec_vocab_dict() const {
+    return nullptr;
   }
   virtual std::unique_ptr<Tokenizer> tokenizer() const = 0;
   virtual std::vector<std::unique_ptr<StateDict>>& get_state_dicts() = 0;
@@ -64,7 +69,8 @@ class ModelLoader {
  public:
   // create a model loader from the given path
   static std::unique_ptr<ModelLoader> create(
-      const std::string& model_weights_path);
+      const std::string& model_weights_path,
+      std::shared_ptr<const RecVocabDict> rec_vocab_dict = nullptr);
 };
 
 }  // namespace xllm

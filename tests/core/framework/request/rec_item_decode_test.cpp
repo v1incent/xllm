@@ -13,8 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/request/rec_item_utils.h"
-
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -27,9 +25,9 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "core/common/version_singleton.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/rec_config.h"
+#include "core/framework/request/rec_item_utils.h"
 #include "core/framework/request/request_output.h"
 #include "core/framework/state_dict/rec_vocab_dict.h"
 #include "core/framework/tokenizer/rec_tokenizer.h"
@@ -66,8 +64,10 @@ SequenceOutput decode_with_proxy(std::unique_ptr<Tokenizer> tokenizer,
       cloned = proxy.clone();
       decoder = cloned.get();
     }
-    decode_rec_items(*decoder, /*skip_special_tokens=*/true,
-                     /*sequence_index=*/0, output);
+    decode_rec_items(*decoder,
+                     /*skip_special_tokens=*/true,
+                     /*sequence_index=*/0,
+                     output);
   });
   worker.join();
   return output;
@@ -88,8 +88,8 @@ class RecItemDecodeTest : public ::testing::Test {
         "rec_item_decode_" +
         std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count());
-    vocab_path_ = std::filesystem::path(::testing::TempDir()) /
-                  (model_version_ + ".bin");
+    vocab_path_ =
+        std::filesystem::path(::testing::TempDir()) / (model_version_ + ".bin");
     const std::vector<std::pair<RecItemInfo, RecTokenTriple>> records{
         {{101, "did-101", "type-1"}, {1, 2, 3}},
         {{202, "did-202", "type-2"}, {4, 5, 6}}};
@@ -108,18 +108,20 @@ class RecItemDecodeTest : public ::testing::Test {
     }
     stream.close();
     ASSERT_TRUE(stream.good());
-    ASSERT_TRUE(VersionSingleton<RecVocabDict>::GetInstance(model_version_)
-                    ->initialize(vocab_path_.string()));
+    vocab_dict_ = std::make_shared<RecVocabDict>();
+    ASSERT_TRUE(vocab_dict_->initialize(vocab_path_.string()));
   }
 
   void TearDown() override {
     std::filesystem::remove(vocab_path_);
+    vocab_dict_.reset();
     RecConfig::get_instance() = saved_config_;
     ExecutionConfig::get_instance().random_seed(saved_seed_);
   }
 
   std::unique_ptr<Tokenizer> make_tokenizer() const {
-    return std::make_unique<RecTokenizer>(model_version_, TokenizerArgs{});
+    return std::make_unique<RecTokenizer>(
+        model_version_, TokenizerArgs{}, vocab_dict_);
   }
 
   void expect_metadata(const SequenceOutput& output,
@@ -144,14 +146,17 @@ class RecItemDecodeTest : public ::testing::Test {
   int32_t saved_seed_ = -1;
   std::string model_version_;
   std::filesystem::path vocab_path_;
+  std::shared_ptr<RecVocabDict> vocab_dict_;
 };
 
 TEST_F(RecItemDecodeTest, DirectTokenizerPreservesMetadata) {
   const auto tokenizer = make_tokenizer();
   SequenceOutput output{};
   output.token_ids = {1, 2, 3, 4, 5, 6};
-  decode_rec_items(*tokenizer, /*skip_special_tokens=*/true,
-                   /*sequence_index=*/0, output);
+  decode_rec_items(*tokenizer,
+                   /*skip_special_tokens=*/true,
+                   /*sequence_index=*/0,
+                   output);
   expect_metadata(output, {101, 202});
 }
 
@@ -167,7 +172,8 @@ TEST_F(RecItemDecodeTest, ProxyPreservesMultipleItemsAndSkipsUnknownTokens) {
 }
 
 TEST_F(RecItemDecodeTest, ClonedProxyPreservesMetadata) {
-  const auto output = decode_with_proxy(make_tokenizer(), {4, 5, 6},
+  const auto output = decode_with_proxy(make_tokenizer(),
+                                        {4, 5, 6},
                                         /*clone_proxy=*/true);
   expect_metadata(output, {202});
 }

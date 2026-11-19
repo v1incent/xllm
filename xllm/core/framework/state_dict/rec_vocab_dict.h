@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <boost/functional/hash.hpp>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -140,4 +141,5 @@ class RecVocabDict final {
                      boost::hash<std::vector<int32_t>>>
       prefix_tokens_to_next_tokens_map_;
 };
+
 }  // namespace xllm

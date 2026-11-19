@@ -76,6 +76,12 @@ OneRecBatchInputBuilderCache* RecEngine::input_builder_cache() {
   return cache.get();
 }
 
+void RecEngine::set_rec_vocab_dict(
+    std::shared_ptr<const RecVocabDict> rec_vocab_dict) {
+  CHECK(tokenizer_ == nullptr);
+  rec_vocab_dict_ = std::move(rec_vocab_dict);
+}
+
 bool RecEngine::init() {
   if (!init_model()) {
     LOG(ERROR) << "Failed to init model from: " << options_.model_path();
@@ -94,7 +100,8 @@ bool RecEngine::init() {
 
 bool RecEngine::init_model() {
   const std::string& model_path = options_.model_path();
-  auto model_loader = ModelLoader::create(model_path);
+  auto model_loader = ModelLoader::create(model_path, rec_vocab_dict_);
+  rec_vocab_dict_ = model_loader->rec_vocab_dict();
 
   tokenizer_ = model_loader->tokenizer();
   CHECK(tokenizer_ != nullptr);
@@ -631,6 +638,7 @@ bool RecEngine::OneRecLocalEnginePipeline::init_model_workers(
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(engine_.workers_.size());
   for (auto& worker : engine_.workers_) {
+    worker->set_rec_vocab_dict(engine_.rec_vocab_dict_);
     futures.emplace_back(worker->init_model_async(
         model_path,
         ::xllm::ExecutionConfig::get_instance().random_seed(),
@@ -1111,6 +1119,7 @@ bool RecEngine::RecMultiRoundEnginePipeline::init_model_workers(
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(engine_.workers_.size());
   for (auto& worker : engine_.workers_) {
+    worker->set_rec_vocab_dict(engine_.rec_vocab_dict_);
     futures.emplace_back(worker->init_model_async(
         model_path,
         ::xllm::ExecutionConfig::get_instance().random_seed(),

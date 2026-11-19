@@ -164,6 +164,11 @@ folly::SemiFuture<folly::Unit> Worker::process_group_test_async() {
 }
 
 // initialize model, cache manager. async call
+void Worker::set_rec_vocab_dict(
+    std::shared_ptr<const RecVocabDict> rec_vocab_dict) {
+  impl_->set_rec_vocab_dict(std::move(rec_vocab_dict));
+}
+
 folly::SemiFuture<bool> Worker::init_model_async(
     const std::string& model_weights_path,
     int32_t random_seed,

@@ -62,7 +62,6 @@ limitations under the License.
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "platform/npu/device_capture_lock.h"
 #endif
-#include "common/version_singleton.h"
 #include "framework/model_loader.h"
 #include "framework/sampling/rec_constrained_decoding.h"
 #include "framework/sampling/rec_sampler.h"
@@ -86,15 +85,6 @@ constexpr const char* kOnerecXAttentionAsyncOutputReadyEnv =
 // Keep the legacy environment variable name for launch-config compatibility.
 constexpr const char* kOnerecXAttentionCacheSelectedTokenIdxesEnv =
     "XLLM_ONEREC_XATTN_CACHE_DECODE_INPUT_TENSORS";
-
-RecVocabDict* get_onerec_vocab_dict(const std::string& model_weights_path) {
-  if (model_weights_path.empty()) {
-    return nullptr;
-  }
-  const std::string model_version =
-      std::filesystem::path(model_weights_path).filename().string();
-  return VersionSingleton<RecVocabDict>::GetInstance(model_version);
-}
 
 int32_t get_onerec_decode_round(const OneRecXAttentionParams& params) {
   if (params.rec_stage != OneRecModelInputParams::RecStage::DECODE ||
@@ -861,7 +851,7 @@ RecWorkerImpl::OneRecWorkPipeline::OneRecWorkPipeline(
     return;
   }
 
-  auto* vocab_dict = get_onerec_vocab_dict(runtime_.worker.model_weights_path_);
+  auto vocab_dict = runtime_.worker.rec_vocab_dict_;
   CHECK(vocab_dict != nullptr)
       << "Failed to get RecVocabDict for OneRec constrained decoding, "
       << "model_path=" << runtime_.worker.model_weights_path_;
@@ -1113,7 +1103,7 @@ RecWorkerImpl::OneRecXAttentionWorkPipeline::OneRecXAttentionWorkPipeline(
   if (!RecConfig::get_instance().enable_constrained_decoding()) {
     return;
   }
-  auto* vocab_dict = get_onerec_vocab_dict(runtime_.worker.model_weights_path_);
+  auto vocab_dict = runtime_.worker.rec_vocab_dict_;
   CHECK(vocab_dict != nullptr)
       << "Failed to get RecVocabDict for OneRec xattention constrained "
          "decoding, model_path="
@@ -3593,7 +3583,8 @@ void RecWorkerImpl::load_model(std::unique_ptr<ModelLoader> loader) {
 
   // Create new loaders and load weights for other model instances
   for (size_t i = 1; i < work_pipelines_.size(); ++i) {
-    auto model_loader = ModelLoader::create(model_weights_path);
+    auto model_loader =
+        ModelLoader::create(model_weights_path, rec_vocab_dict_);
     CHECK(model_loader != nullptr)
         << "Failed to create ModelLoader for model instance " << i;
     work_pipelines_[i]->runtime().model->load_model(std::move(model_loader));

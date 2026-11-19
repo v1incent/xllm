@@ -39,6 +39,7 @@ limitations under the License.
 namespace xllm {
 
 class KVCacheShape;
+class RecVocabDict;
 
 class RecEngine : public Engine {
  public:
@@ -52,6 +53,8 @@ class RecEngine : public Engine {
   const runtime::Options& options() const { return options_; }
 
   bool init() override;
+
+  void set_rec_vocab_dict(std::shared_ptr<const RecVocabDict> rec_vocab_dict);
 
   void update_last_step_result(std::vector<Batch>& batch) override;
 
@@ -199,6 +202,7 @@ class RecEngine : public Engine {
                      std::unique_ptr<OneRecBatchInputBuilderCache>>
       input_caches_;
   runtime::Options options_;
+  std::shared_ptr<const RecVocabDict> rec_vocab_dict_;
   torch::ScalarType dtype_;
   QuantArgs quant_args_;
 
