@@ -1044,6 +1044,9 @@ void NpuOneRecBlockLayerImpl::merge_loaded_weights() {
   CHECK_EQ(init_status, atb::NO_ERROR)
       << "OneRec BlockLayer init_layer failed, layer_role="
       << (is_decoder_ ? "decoder" : "encoder") << ", layer_id=" << layer_id_;
+  if (prefill_param_.use_moe) {
+    release_expert_weight_staging();
+  }
 }
 
 void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
@@ -1131,18 +1134,7 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
   }();
 
   if (prefill_param_.use_moe) {
-    for (auto& [key, tensors] : experts_weights_) {
-      (void)key;
-      for (auto& t : tensors) {
-        t = torch::Tensor();
-      }
-    }
-    shared_expert_weights_map_.clear();
-    fused_expert_weight1_scale_ = torch::Tensor();
-    fused_expert_weight2_scale_ = torch::Tensor();
-    shared_expert_gate_weights_.clear();
-    shared_expert_up_weights_.clear();
-    shared_expert_down_weights_.clear();
+    release_expert_weight_staging();
 
     for (const auto& [state_key, tensor] : state_dict) {
       if (state_key.find(".ffn.experts.") != std::string::npos) {
@@ -2205,6 +2197,20 @@ torch::Tensor NpuOneRecBlockLayerImpl::merge_experts_weights(
     }
   }
   return merge_experts_weights(experts_gate, transpose);
+}
+
+void NpuOneRecBlockLayerImpl::release_expert_weight_staging() {
+  for (auto& weight_group : experts_weights_) {
+    for (torch::Tensor& tensor : weight_group.second) {
+      tensor = torch::Tensor();
+    }
+  }
+  fused_expert_weight1_scale_ = torch::Tensor();
+  fused_expert_weight2_scale_ = torch::Tensor();
+  shared_expert_weights_map_.clear();
+  shared_expert_gate_weights_.clear();
+  shared_expert_up_weights_.clear();
+  shared_expert_down_weights_.clear();
 }
 
 void NpuOneRecBlockLayerImpl::merge_experts_weights() {
