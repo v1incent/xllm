@@ -24,6 +24,7 @@ limitations under the License.
 #include <atomic>
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -279,6 +280,8 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize_with_devices(
         << ::xllm::RecConfig::get_instance().max_decode_rounds();
 
 #if defined(USE_NPU)
+    PCHECK(setenv("XLLM_ATB_ACLNN_THREAD_LOCAL_CACHE", "1", 1) == 0)
+        << "Failed to enable thread-local ACLNN caches";
     const int32_t runtime_device_index =
         rec_device_index >= 0 ? rec_device_index
                               : xllm::DeviceNameUtils::get_device_idx(

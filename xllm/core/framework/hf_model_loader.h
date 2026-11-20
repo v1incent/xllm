@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <memory>
 #include <vector>
 
 #include "core/framework/state_dict/state_dict.h"
@@ -27,11 +28,18 @@ limitations under the License.
 
 namespace xllm {
 
+class RecVocabDict;
+
 bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args);
 
 class HFModelLoader : public ModelLoader {
  public:
-  HFModelLoader(const std::string& model_weights_path);
+  HFModelLoader(const std::string& model_weights_path,
+                std::shared_ptr<const RecVocabDict> rec_vocab_dict = nullptr);
+
+  std::shared_ptr<const RecVocabDict> rec_vocab_dict() const override {
+    return rec_vocab_dict_;
+  }
 
   std::unique_ptr<Tokenizer> tokenizer() const override;
 
@@ -55,6 +63,7 @@ class HFModelLoader : public ModelLoader {
     return model_weights_path_;
   }
   std::string model_weights_path_;
+  std::shared_ptr<const RecVocabDict> rec_vocab_dict_;
 
   // sorted model weights files
   std::vector<std::string> model_weights_files_;

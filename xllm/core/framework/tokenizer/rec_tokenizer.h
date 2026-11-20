@@ -30,9 +30,13 @@ limitations under the License.
 
 namespace xllm {
 
+class RecVocabDict;
+
 class RecTokenizer : public Tokenizer {
  public:
-  RecTokenizer(const std::string_view& dir_path, const TokenizerArgs& args);
+  RecTokenizer(const std::string_view& dir_path,
+               const TokenizerArgs& args,
+               std::shared_ptr<const RecVocabDict> vocab_dict = nullptr);
 
   virtual ~RecTokenizer() = default;
 
@@ -54,7 +58,7 @@ class RecTokenizer : public Tokenizer {
 
   std::string dir_path_;
 
-  std::string model_version_;
+  std::shared_ptr<const RecVocabDict> vocab_dict_;
 };
 
 }  // namespace xllm

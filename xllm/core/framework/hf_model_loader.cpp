@@ -34,7 +34,6 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
-#include "core/common/version_singleton.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/state_dict/rec_vocab_dict.h"
@@ -471,8 +470,10 @@ bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args) {
       reader, quant_args, only_expert_per_group);
 }
 
-HFModelLoader::HFModelLoader(const std::string& model_weights_path)
-    : model_weights_path_(model_weights_path) {
+HFModelLoader::HFModelLoader(const std::string& model_weights_path,
+                             std::shared_ptr<const RecVocabDict> rec_vocab_dict)
+    : model_weights_path_(model_weights_path),
+      rec_vocab_dict_(std::move(rec_vocab_dict)) {
   CHECK(load_args(model_weights_path))
       << "Failed to load model args from " << model_weights_path;
   // try to load safetensors first
@@ -493,15 +494,15 @@ HFModelLoader::HFModelLoader(const std::string& model_weights_path)
       /*cpu_binding=*/false,
       /*pool_name=*/"HFModelLoader.load_weights");
   if (::xllm::ModelConfig::get_instance().backend() == "rec" &&
-      is_onerec_model_type(args_.model_type())) {
+      is_onerec_model_type(args_.model_type()) && rec_vocab_dict_ == nullptr) {
     CHECK(load_rec_vocab(model_weights_path))
         << "Failed to load rec content from " << model_weights_path;
   }
 }
 
 std::unique_ptr<Tokenizer> HFModelLoader::tokenizer() const {
-  return TokenizerFactory::create_tokenizer(model_weights_path_,
-                                            tokenizer_args_);
+  return TokenizerFactory::create_tokenizer(
+      model_weights_path_, tokenizer_args_, true, rec_vocab_dict_);
 }
 
 std::vector<std::unique_ptr<StateDict>>& HFModelLoader::get_state_dicts() {
@@ -726,9 +727,6 @@ int64_t HFModelLoader::get_max_decoder_layer_weight_size() const {
 }
 
 bool HFModelLoader::load_rec_vocab(const std::string& model_weights_path) {
-  const std::string model_version =
-      std::filesystem::path(model_weights_path).filename().string();
-
   std::string vocab_file;
   std::string vocab_source;
   if (!RecConfig::get_instance().constrained_decoding_filter_path().empty()) {
@@ -744,15 +742,15 @@ bool HFModelLoader::load_rec_vocab(const std::string& model_weights_path) {
     const std::string vocab_full_path =
         (std::filesystem::path(model_weights_path) / vocab_file).string();
 
-    LOG(INFO) << "Model_version: " << model_version
+    LOG(INFO) << "Model_path: " << model_weights_path
               << ", vocab_full_path: " << vocab_full_path
               << ", vocab_source: " << vocab_source;
 
-    CHECK(nullptr != VersionSingleton<RecVocabDict>::GetInstance(model_version))
-        << "Failed to get vocab dict instance";
-    CHECK(VersionSingleton<RecVocabDict>::GetInstance(model_version)
-              ->initialize(vocab_full_path))
-        << "Failed to initialize vocab dict from " << vocab_full_path;
+    auto dictionary = std::make_shared<RecVocabDict>();
+    if (!dictionary->initialize(vocab_full_path)) {
+      return false;
+    }
+    rec_vocab_dict_ = std::move(dictionary);
     return true;
   }
 

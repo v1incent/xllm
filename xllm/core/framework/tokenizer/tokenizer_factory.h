@@ -30,7 +30,8 @@ class TokenizerFactory {
   static std::unique_ptr<Tokenizer> create_tokenizer(
       const std::string& model_weights_path,
       TokenizerArgs tokenizer_args,
-      bool proxy = true);
+      bool proxy = true,
+      std::shared_ptr<const RecVocabDict> rec_vocab_dict = nullptr);
 };
 
 }  // namespace xllm

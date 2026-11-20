@@ -16,23 +16,24 @@ limitations under the License.
 
 #include "rec_tokenizer.h"
 
-#include <filesystem>
-
-#include "common/version_singleton.h"
+#include "core/framework/config/rec_config.h"
 #include "state_dict/rec_vocab_dict.h"
 
 namespace xllm {
 RecTokenizer::RecTokenizer(const std::string_view& dir_path,
-                           const TokenizerArgs& args) {
-  args_ = args;
-  dir_path_ = dir_path;
-  model_version_ = std::filesystem::path(dir_path).filename();
+                           const TokenizerArgs& args,
+                           std::shared_ptr<const RecVocabDict> vocab_dict)
+    : args_(args), dir_path_(dir_path), vocab_dict_(std::move(vocab_dict)) {
+  CHECK(vocab_dict_ != nullptr ||
+        (args_.vocab_file().empty() &&
+         RecConfig::get_instance().constrained_decoding_filter_path().empty()))
+      << "REC tokenizer requires the owner's loaded dictionary";
 }
 
 bool RecTokenizer::encode(int64_t item_id,
                           std::vector<int32_t>* token_ids) const {
-  return VersionSingleton<RecVocabDict>::GetInstance(model_version_)
-      ->get_tokens_by_item(item_id, token_ids);
+  return vocab_dict_ != nullptr &&
+         vocab_dict_->get_tokens_by_item(item_id, token_ids);
 }
 
 bool RecTokenizer::decode(const Slice<int32_t>& token_ids,
@@ -44,8 +45,8 @@ bool RecTokenizer::decode(const Slice<int32_t>& token_ids,
   RecTokenTriple rec_token_triple;
   std::copy(token_ids.begin(), token_ids.end(), rec_token_triple.begin());
 
-  return VersionSingleton<RecVocabDict>::GetInstance(model_version_)
-      ->get_items_by_tokens(rec_token_triple, item_ids);
+  return vocab_dict_ != nullptr &&
+         vocab_dict_->get_items_by_tokens(rec_token_triple, item_ids);
 }
 
 bool RecTokenizer::decode_item_infos(
@@ -56,8 +57,8 @@ bool RecTokenizer::decode_item_infos(
   RecTokenTriple rec_token_triple;
   std::copy(token_ids.begin(), token_ids.end(), rec_token_triple.begin());
 
-  return VersionSingleton<RecVocabDict>::GetInstance(model_version_)
-      ->get_item_infos_by_tokens(rec_token_triple, item_infos);
+  return vocab_dict_ != nullptr &&
+         vocab_dict_->get_item_infos_by_tokens(rec_token_triple, item_infos);
 }
 
 size_t RecTokenizer::vocab_size() const {
@@ -67,7 +68,7 @@ size_t RecTokenizer::vocab_size() const {
 }
 
 std::unique_ptr<Tokenizer> RecTokenizer::clone() const {
-  return std::make_unique<RecTokenizer>(dir_path_, args_);
+  return std::make_unique<RecTokenizer>(*this);
 }
 
 }  // namespace xllm

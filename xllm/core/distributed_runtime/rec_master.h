@@ -34,7 +34,9 @@ namespace xllm {
 
 class RecMaster : public Master {
  public:
-  explicit RecMaster(const Options& options);
+  explicit RecMaster(
+      const Options& options,
+      std::shared_ptr<const RecVocabDict> rec_vocab_dict = nullptr);
   ~RecMaster();
 
   // handle a request, the engine will execute the request asynchronously

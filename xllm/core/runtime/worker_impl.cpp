@@ -1718,6 +1718,12 @@ folly::SemiFuture<folly::Unit> WorkerImpl::process_group_test_async() {
   return future;
 }
 
+void WorkerImpl::set_rec_vocab_dict(
+    std::shared_ptr<const RecVocabDict> rec_vocab_dict) {
+  CHECK(model_ == nullptr);
+  rec_vocab_dict_ = std::move(rec_vocab_dict);
+}
+
 folly::SemiFuture<bool> WorkerImpl::init_model_async(
     const std::string& model_weights_path,
     int32_t random_seed,
@@ -1777,7 +1783,8 @@ bool WorkerImpl::xtensor_sleep(MasterStatus master_status) {
   // The memory for kvcache and model weights from hbm is released by xtensor;
   if (master_status == MasterStatus::LIGHT_SLEEP) {
     // only load model weights to host memory.
-    auto model_loader = ModelLoader::create(model_weights_path_);
+    auto model_loader =
+        ModelLoader::create(model_weights_path_, rec_vocab_dict_);
     model_->lazy_load_model(std::move(model_loader));
   } else if (master_status == MasterStatus::DEEP_SLEEP) {
     // only release model weights from host memory.
@@ -1895,7 +1902,8 @@ bool WorkerImpl::wakeup_local(const WakeupOptions& options) {
     model_->reload_model_weights();
 #endif
   } else if (options.master_status == MasterStatus::DEEP_SLEEP) {
-    auto model_loader = ModelLoader::create(model_weights_path_);
+    auto model_loader =
+        ModelLoader::create(model_weights_path_, rec_vocab_dict_);
     this->load_model(std::move(model_loader));
   }
   return true;
@@ -1976,10 +1984,13 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
                             int32_t random_seed,
                             MasterStatus master_status) {
   // set same random seed for all worker
-  ::xllm::ExecutionConfig::get_instance().random_seed(random_seed);
+  if (::xllm::ExecutionConfig::get_instance().random_seed() != random_seed) {
+    ::xllm::ExecutionConfig::get_instance().random_seed(random_seed);
+  }
   device_.set_seed(random_seed);
 
-  auto model_loader = ModelLoader::create(model_weights_path);
+  auto model_loader = ModelLoader::create(model_weights_path, rec_vocab_dict_);
+  rec_vocab_dict_ = model_loader->rec_vocab_dict();
   model_weights_path_ = std::move(model_weights_path);
 
   auto args = model_loader->model_args();

@@ -20,6 +20,7 @@ limitations under the License.
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <random>
 #include <string>
 #include <unordered_set>
@@ -320,6 +321,100 @@ TEST(RecVocabDictTest, BuildConstraintTablesMatchesLegacyPrefixMap) {
             prefix2_values_for_tokens(tables, /*t0=*/1, /*t1=*/2));
 
   std::filesystem::remove(vocab_path);
+}
+
+class RecVocabDictOwnershipTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    saved_decoding_ = std::make_unique<ScopedConstrainedDecodingFlag>(true);
+    saved_extended_ = RecConfig::get_instance().enable_extended_item_info();
+    RecConfig::get_instance().enable_extended_item_info(false);
+    root_ = std::filesystem::path(::testing::TempDir()) /
+            (std::string("rec_vocab_ownership_") +
+             ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    std::filesystem::remove_all(root_);
+    std::filesystem::create_directories(root_);
+  }
+
+  void TearDown() override {
+    std::filesystem::remove_all(root_);
+    RecConfig::get_instance().enable_extended_item_info(saved_extended_);
+    saved_decoding_.reset();
+  }
+
+  std::filesystem::path model_path(const std::string& identity) {
+    const std::filesystem::path path = root_ / identity / "graph3";
+    std::filesystem::create_directories(path);
+    return path;
+  }
+
+  std::filesystem::path write_dictionary(const std::filesystem::path& model,
+                                         int64_t item_id) {
+    const std::filesystem::path path = model / "vocab.bin";
+    write_vocab_file(path, {{item_id, RecTokenTriple{1, 2, 3}}});
+    return path;
+  }
+
+  std::filesystem::path root_;
+  std::unique_ptr<ScopedConstrainedDecodingFlag> saved_decoding_;
+  bool saved_extended_ = false;
+};
+
+TEST_F(RecVocabDictOwnershipTest, SameFileLoadsIndependentDictionaries) {
+  const std::filesystem::path model = model_path("model_alpha/v1");
+  const std::filesystem::path vocab = write_dictionary(model, 1001);
+  auto first = std::make_shared<RecVocabDict>();
+  auto second = std::make_shared<RecVocabDict>();
+  ASSERT_TRUE(first->initialize(vocab.string()));
+  ASSERT_TRUE(second->initialize(vocab.string()));
+  EXPECT_NE(first, second);
+  std::vector<int64_t> items;
+  ASSERT_TRUE(second->get_items_by_tokens({1, 2, 3}, &items));
+  EXPECT_EQ(items, (std::vector<int64_t>{1001}));
+}
+
+TEST_F(RecVocabDictOwnershipTest, DestroyingOneOwnerDoesNotReleaseAnother) {
+  const std::filesystem::path model = model_path("model_alpha/v1");
+  const std::filesystem::path vocab = write_dictionary(model, 1001);
+  auto first = std::make_shared<RecVocabDict>();
+  auto second = std::make_shared<RecVocabDict>();
+  ASSERT_TRUE(first->initialize(vocab.string()));
+  ASSERT_TRUE(second->initialize(vocab.string()));
+  std::weak_ptr<const RecVocabDict> weak = first;
+  first.reset();
+  EXPECT_TRUE(weak.expired());
+  std::vector<int64_t> items;
+  ASSERT_TRUE(second->get_items_by_tokens({1, 2, 3}, &items));
+  EXPECT_EQ(items, (std::vector<int64_t>{1001}));
+}
+
+TEST_F(RecVocabDictOwnershipTest, PipelineOwnerKeepsDictionaryAlive) {
+  const std::filesystem::path model = model_path("model_alpha/v1");
+  const std::filesystem::path vocab = write_dictionary(model, 1001);
+  auto owner = std::make_shared<RecVocabDict>();
+  ASSERT_TRUE(owner->initialize(vocab.string()));
+  std::weak_ptr<const RecVocabDict> weak = owner;
+  std::shared_ptr<const RecVocabDict> pipeline_owner = owner;
+  owner.reset();
+  EXPECT_FALSE(weak.expired());
+  pipeline_owner.reset();
+  EXPECT_TRUE(weak.expired());
+}
+
+TEST_F(RecVocabDictOwnershipTest, ReloadedFileDoesNotChangeExistingDictionary) {
+  const std::filesystem::path model = model_path("model_alpha/v1");
+  const std::filesystem::path vocab = write_dictionary(model, 1001);
+  auto old_version = std::make_shared<RecVocabDict>();
+  ASSERT_TRUE(old_version->initialize(vocab.string()));
+  write_dictionary(model, 2001);
+  auto new_version = std::make_shared<RecVocabDict>();
+  ASSERT_TRUE(new_version->initialize(vocab.string()));
+  std::vector<int64_t> old_items;
+  std::vector<int64_t> new_items;
+  ASSERT_TRUE(old_version->get_items_by_tokens({1, 2, 3}, &old_items));
+  ASSERT_TRUE(new_version->get_items_by_tokens({1, 2, 3}, &new_items));
+  EXPECT_EQ(old_items, (std::vector<int64_t>{1001}));
+  EXPECT_EQ(new_items, (std::vector<int64_t>{2001}));
 }
 
 }  // namespace xllm
