@@ -28,6 +28,7 @@ limitations under the License.
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
 
@@ -47,6 +48,10 @@ limitations under the License.
 #include "core/util/cpu_affinity.h"
 #include "core/util/rec_infer_timing.h"
 #include "core/util/timer.h"
+
+namespace {
+std::mutex rec_initialization_mutex;
+}
 
 XLLM_CAPI_EXPORT XLLM_REC_Handler* xllm_rec_create(void) {
   XLLM_REC_Handler* handler = new XLLM_REC_Handler();
@@ -87,8 +92,13 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize_with_devices(
     const char* model_path,
     const char* devices,
     const XLLM_InitOptions* init_options) {
-  if (handler == nullptr || model_path == nullptr || devices == nullptr ||
-      handler->initialized) {
+  if (handler == nullptr || model_path == nullptr || devices == nullptr) {
+    return false;
+  }
+  // 多模型部署场景, constrained_decoding_filter_path 路径可能不同,
+  // 通过串行化加载保证.
+  std::lock_guard<std::mutex> initialization_lock(rec_initialization_mutex);
+  if (handler->initialized) {
     return false;
   }
   try {
