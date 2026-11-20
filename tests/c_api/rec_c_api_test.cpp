@@ -16,7 +16,10 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <future>
+#include <limits>
 #include <memory>
+#include <vector>
 
 #include "c_api/rec.h"
 
@@ -74,6 +77,66 @@ TEST(RecCApiTest, RejectsInferenceBeforeModelInitialization) {
   EXPECT_EQ(response->status_code, kNotInitialized);
   XLLM_InferTimingDetail timing{};
   EXPECT_FALSE(xllm_rec_take_last_infer_timing("unseen-request", &timing));
+}
+
+TEST(RecCApiTest, ConcurrentInitializationFailuresAllowRetry) {
+  constexpr size_t kHandlerCount = 4;
+  constexpr size_t kCallerCount = 8;
+  constexpr int32_t kAttempts = 4;
+  std::vector<HandlerPtr> handlers;
+  handlers.reserve(kHandlerCount);
+  for (size_t index = 0; index < kHandlerCount; ++index) {
+    handlers.emplace_back(xllm_rec_create(), xllm_rec_destroy);
+    ASSERT_NE(handlers.back(), nullptr);
+  }
+
+  XLLM_InitOptions options{};
+  xllm_rec_init_options_default(&options);
+  options.flashinfer_workspace_buffer_size =
+      std::numeric_limits<uint32_t>::max();
+  std::promise<void> start;
+  const auto ready = start.get_future().share();
+  std::vector<std::future<bool>> results;
+  results.reserve(kCallerCount);
+  for (size_t index = 0; index < kCallerCount; ++index) {
+    XLLM_REC_Handler* handler = handlers[index % kHandlerCount].get();
+    results.emplace_back(
+        std::async(std::launch::async, [handler, ready, options, index]() {
+          ready.wait();
+          for (int32_t attempt = 0; attempt < kAttempts; ++attempt) {
+            const bool initialized =
+                index % 2 == 0 ? xllm_rec_initialize(handler, ".", &options)
+                               : xllm_rec_initialize_with_devices(
+                                     handler, ".", "auto", &options);
+            if (initialized) {
+              return false;
+            }
+          }
+          return true;
+        }));
+  }
+  start.set_value();
+  for (auto& result : results) {
+    EXPECT_TRUE(result.get());
+  }
+  for (const auto& handler : handlers) {
+    EXPECT_FALSE(xllm_rec_initialize(handler.get(), ".", &options));
+  }
+}
+
+TEST(RecCApiTest, InvalidInitializationArgumentsDoNotBlockRetry) {
+  HandlerPtr handler(xllm_rec_create(), xllm_rec_destroy);
+  ASSERT_NE(handler, nullptr);
+  EXPECT_FALSE(xllm_rec_initialize(handler.get(), nullptr, nullptr));
+  EXPECT_FALSE(
+      xllm_rec_initialize_with_devices(handler.get(), ".", nullptr, nullptr));
+  XLLM_InitOptions options{};
+  xllm_rec_init_options_default(&options);
+  options.flashinfer_workspace_buffer_size =
+      std::numeric_limits<uint32_t>::max();
+  EXPECT_FALSE(xllm_rec_initialize(handler.get(), ".", &options));
+  EXPECT_FALSE(
+      xllm_rec_initialize_with_devices(handler.get(), ".", "auto", &options));
 }
 
 }  // namespace
